@@ -3276,7 +3276,23 @@ function v2rayLinksHandle(str2) {
   }
 }
 var targetUrls = [
-  // ChromeGo/EdgeGo的订阅链接(已剔除内容重复的订阅链接，fastly.jsdelivr.net镜像已失效，改用gitlabip.xyz/gitlab.com镜像)
+  // ChromeGo/EdgeGo的订阅链接(重新加入fastly.jsdelivr.net等镜像,与gitlabip.xyz/gitlab.com互为备用)
+  "https://chg64.makou.cc.cd",
+  "https://chg26.makou.cc.cd",
+  "https://raw.githubusercontent.com/ttanzj/chromego_py/main/outputs/sub_base64.txt",
+  "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub",
+  // AutoMergePublicNodes / NoMoreWalls 的多个CDN镜像(内容相同,互为备用)
+  "https://cdn.jsdelivr.net/gh/chengaopan/AutoMergePublicNodes@master/list.meta.yml",
+  "https://cdn.jsdelivr.net/gh/peasoft/NoMoreWalls@master/list.meta.yml",
+  "https://fastly.jsdelivr.net/gh/chengaopan/AutoMergePublicNodes@master/list.meta.yml",
+  "https://fastly.jsdelivr.net/gh/peasoft/NoMoreWalls@master/list.meta.yml",
+  "https://gcore.jsdelivr.net/gh/peasoft/NoMoreWalls@master/list.meta.yml",
+  "https://ghproxy.cn/https://raw.githubusercontent.com/chengaopan/AutoMergePublicNodes/master/list.meta.yml",
+  "https://ghproxy.net/https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.meta.yml",
+  "https://raw.githubusercontent.com/chengaopan/AutoMergePublicNodes/master/list.meta.yml",
+  "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.meta.yml",
+  "https://testingcf.jsdelivr.net/gh/peasoft/NoMoreWalls@master/list.meta.yml",
+  // gitlabip.xyz / gitlab.com 的 ChromeGo/EdgeGo 订阅链接
   "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/naiveproxy/2/config.json",
   "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria2/2/config.json",
   "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria2/3/config.json",
