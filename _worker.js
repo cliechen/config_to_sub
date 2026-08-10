@@ -1,5 +1,3 @@
-// src/worker.js
-
 // node_modules/js-yaml/dist/js-yaml.mjs
 function isNothing(subject) {
   return typeof subject === "undefined" || subject === null;
@@ -3355,65 +3353,817 @@ async function processUrls(targetUrls2) {
   });
   return results;
 }
+function safeDecode(str2) {
+  try {
+    return decodeURIComponent(str2);
+  } catch (e) {
+    return str2;
+  }
+}
+function splitShareLink(link) {
+  const hashIndex = link.indexOf("#");
+  const fragment = hashIndex >= 0 ? safeDecode(link.slice(hashIndex + 1)) : "";
+  const beforeHash = hashIndex >= 0 ? link.slice(0, hashIndex) : link;
+  const queryIndex = beforeHash.indexOf("?");
+  const params = new URLSearchParams(queryIndex >= 0 ? beforeHash.slice(queryIndex + 1) : "");
+  const base = queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash;
+  return { base, params, fragment };
+}
+function splitHostPort(str2, defaultPort) {
+  str2 = str2 || "";
+  if (str2.startsWith("[")) {
+    const end = str2.indexOf("]");
+    if (end >= 0) {
+      const host = str2.slice(1, end);
+      const rest = str2.slice(end + 1);
+      const port = rest.startsWith(":") ? rest.slice(1) : "";
+      return { host, port: port ? parseInt(port, 10) : defaultPort };
+    }
+  }
+  const idx = str2.lastIndexOf(":");
+  if (idx >= 0) {
+    return { host: str2.slice(0, idx), port: parseInt(str2.slice(idx + 1), 10) || defaultPort };
+  }
+  return { host: str2, port: defaultPort };
+}
+function vmessNodeFromJson(j) {
+  const name = j.ps || `${j.add}:${j.port}`;
+  return {
+    type: "vmess",
+    name,
+    server: j.add,
+    port: parseInt(j.port, 10) || 443,
+    uuid: j.id,
+    alterId: parseInt(j.aid, 10) || 0,
+    cipher: j.scy || "auto",
+    network: j.net || "tcp",
+    headerType: j.type || "none",
+    host: j.host || "",
+    path: j.path || "/",
+    tls: j.tls === "tls" || j.tls === true,
+    sni: j.sni || "",
+    alpn: j.alpn || "",
+    fp: j.fp || ""
+  };
+}
+function parseShareLink(link) {
+  let type2 = "";
+  if (link.startsWith("vless://"))
+    type2 = "vless";
+  else if (link.startsWith("vmess://"))
+    type2 = "vmess";
+  else if (link.startsWith("trojan://"))
+    type2 = "trojan";
+  else if (link.startsWith("ss://"))
+    type2 = "ss";
+  else if (link.startsWith("hysteria://"))
+    type2 = "hysteria";
+  else if (link.startsWith("hy2://"))
+    type2 = "hy2";
+  else if (link.startsWith("tuic://"))
+    type2 = "tuic";
+  else if (link.startsWith("naive+https://"))
+    type2 = "naive";
+  if (!type2)
+    return null;
+  try {
+    const scheme = type2 === "naive" ? "naive+https://" : `${type2}://`;
+    const { base, params, fragment } = splitShareLink(link);
+    const rest = base.slice(scheme.length);
+    const atIndex = rest.lastIndexOf("@");
+    const userinfo = atIndex >= 0 ? rest.slice(0, atIndex) : rest;
+    const hostPort = atIndex >= 0 ? rest.slice(atIndex + 1) : rest;
+    if (type2 === "vless") {
+      const { host, port } = splitHostPort(hostPort, 443);
+      return {
+        type: type2,
+        name: fragment || `${host}:${port}`,
+        server: host,
+        port,
+        uuid: safeDecode(userinfo),
+        flow: params.get("flow") || "",
+        security: params.get("security") || "",
+        sni: params.get("sni") || "",
+        fp: params.get("fp") || "",
+        pbk: params.get("pbk") || "",
+        sid: params.get("sid") || "",
+        network: params.get("type") || "tcp",
+        host: params.get("host") || "",
+        path: params.get("path") || "",
+        alpn: params.get("alpn") || ""
+      };
+    }
+    if (type2 === "vmess") {
+      if (atIndex >= 0) {
+        const { host, port } = splitHostPort(hostPort, 443);
+        return vmessNodeFromJson({
+          ps: fragment || `${host}:${port}`,
+          add: host,
+          port,
+          id: safeDecode(userinfo),
+          aid: params.get("aid") || 0,
+          scy: params.get("scy") || "auto",
+          net: params.get("type") || "tcp",
+          type: params.get("headerType") || "none",
+          host: params.get("host") || "",
+          path: params.get("path") || "/",
+          tls: params.get("security") === "tls" ? "tls" : "",
+          sni: params.get("sni") || "",
+          alpn: params.get("alpn") || "",
+          fp: params.get("fp") || ""
+        });
+      }
+      try {
+        return vmessNodeFromJson(JSON.parse(base64Decode(safeDecode(userinfo))));
+      } catch (e) {
+        return null;
+      }
+    }
+    if (type2 === "trojan") {
+      const { host, port } = splitHostPort(hostPort, 443);
+      return {
+        type: type2,
+        name: fragment || `${host}:${port}`,
+        server: host,
+        port,
+        password: safeDecode(userinfo),
+        security: params.get("security") || "",
+        sni: params.get("sni") || "",
+        fp: params.get("fp") || "",
+        alpn: params.get("alpn") || "",
+        network: params.get("type") || "tcp",
+        host: params.get("host") || "",
+        path: params.get("path") || "",
+        allowInsecure: ["1", "true", "yes"].includes(
+          (params.get("allowInsecure") || params.get("allow_insecure") || "").toLowerCase()
+        )
+      };
+    }
+    if (type2 === "ss") {
+      const { host, port } = splitHostPort(hostPort, 8388);
+      let raw = safeDecode(userinfo);
+      if (isValidBase64(raw)) {
+        raw = base64Decode(raw);
+      }
+      const colonIndex = raw.indexOf(":");
+      const method = colonIndex >= 0 ? raw.slice(0, colonIndex) : raw;
+      const password = colonIndex >= 0 ? raw.slice(colonIndex + 1) : "";
+      return {
+        type: type2,
+        name: fragment || `${host}:${port}`,
+        server: host,
+        port,
+        method,
+        password,
+        plugin: params.get("plugin") || ""
+      };
+    }
+    if (type2 === "hysteria") {
+      const { host, port } = splitHostPort(hostPort, 443);
+      const up = params.get("upmbps") || "";
+      const down = params.get("downmbps") || "";
+      return {
+        type: type2,
+        name: fragment || `${host}:${port}`,
+        server: host,
+        port,
+        up: up ? parseInt(String(up).replace(/\D/g, ""), 10) : "",
+        down: down ? parseInt(String(down).replace(/\D/g, ""), 10) : "",
+        obfs: params.get("obfs") || "",
+        obfsParam: params.get("obfsParam") || "",
+        auth: params.get("auth") || params.get("auth_str") || "",
+        protocol: params.get("protocol") || "",
+        insecure: params.get("insecure") === "1",
+        peer: params.get("peer") || "",
+        alpn: params.get("alpn") || ""
+      };
+    }
+    if (type2 === "hy2") {
+      const { host, port } = splitHostPort(hostPort, 443);
+      const up = params.get("upmbps") || "";
+      const down = params.get("downmbps") || "";
+      return {
+        type: type2,
+        name: fragment || `${host}:${port}`,
+        server: host,
+        port,
+        password: safeDecode(userinfo),
+        up: up ? parseInt(String(up).replace(/\D/g, ""), 10) : "",
+        down: down ? parseInt(String(down).replace(/\D/g, ""), 10) : "",
+        obfs: params.get("obfs") || "",
+        obfsPassword: params.get("obfs-password") || "",
+        sni: params.get("sni") || "",
+        insecure: params.get("insecure") === "1"
+      };
+    }
+    if (type2 === "tuic") {
+      const { host, port } = splitHostPort(hostPort, 443);
+      const colonIndex = userinfo.lastIndexOf(":");
+      return {
+        type: type2,
+        name: fragment || `${host}:${port}`,
+        server: host,
+        port,
+        uuid: safeDecode(colonIndex >= 0 ? userinfo.slice(0, colonIndex) : userinfo),
+        password: colonIndex >= 0 ? safeDecode(userinfo.slice(colonIndex + 1)) : "",
+        congestion: params.get("congestion_control") || "",
+        udpRelayMode: params.get("udp_relay_mode") || "",
+        alpn: params.get("alpn") || "",
+        sni: params.get("sni") || "",
+        insecure: params.get("allow_insecure") === "1"
+      };
+    }
+    if (type2 === "naive") {
+      const { host, port } = splitHostPort(hostPort, 443);
+      const colonIndex = userinfo.lastIndexOf(":");
+      return {
+        type: type2,
+        name: fragment || `${host}:${port}`,
+        server: host,
+        port,
+        username: safeDecode(colonIndex >= 0 ? userinfo.slice(0, colonIndex) : userinfo),
+        password: colonIndex >= 0 ? safeDecode(userinfo.slice(colonIndex + 1)) : ""
+      };
+    }
+    return null;
+  } catch (e) {
+    console.error(`\u89E3\u6790\u5206\u4EAB\u94FE\u63A5\u5931\u8D25: ${e.message}`);
+    return null;
+  }
+}
+function dedupeNodeNames(nodes) {
+  const seen = /* @__PURE__ */ new Map();
+  return nodes.map((node) => {
+    const baseName = node.name || `${node.server}:${node.port}`;
+    const count = seen.get(baseName) || 0;
+    seen.set(baseName, count + 1);
+    return { ...node, name: count === 0 ? baseName : `${baseName}_${count + 1}` };
+  });
+}
+function buildClashConfig(nodes) {
+  const proxies = dedupeNodeNames(nodes).map(toClashProxy).filter(Boolean);
+  const names = proxies.map((p) => p.name);
+  return {
+    proxies,
+    "proxy-groups": [
+      {
+        name: "\u267B\uFE0F \u81EA\u52A8\u9009\u62E9",
+        type: "url-test",
+        url: "http://www.gstatic.com/generate_204",
+        interval: 300,
+        proxies: names
+      },
+      {
+        name: "\u{1F680} \u8282\u70B9\u9009\u62E9",
+        type: "select",
+        proxies: ["\u267B\uFE0F \u81EA\u52A8\u9009\u62E9", ...names]
+      }
+    ]
+  };
+}
+function toClashProxy(node) {
+  try {
+    switch (node.type) {
+      case "vless":
+        return toClashVless(node);
+      case "vmess":
+        return toClashVmess(node);
+      case "trojan":
+        return toClashTrojan(node);
+      case "ss":
+        return toClashSs(node);
+      case "hysteria":
+        return toClashHysteria(node);
+      case "hy2":
+        return toClashHy2(node);
+      case "tuic":
+        return toClashTuic(node);
+      case "naive":
+        return toClashNaive(node);
+      default:
+        return null;
+    }
+  } catch (e) {
+    console.error(`\u8F6C\u6362clash\u8282\u70B9\u5931\u8D25(${node.name}): ${e.message}`);
+    return null;
+  }
+}
+function clashTransportOpts(node, network) {
+  if (network === "ws") {
+    const opts = {};
+    if (node.path)
+      opts.path = node.path;
+    if (node.host)
+      opts.headers = { Host: node.host };
+    return Object.keys(opts).length > 0 ? opts : void 0;
+  } else if (network === "grpc") {
+    if (node.path)
+      return { "grpc-service-name": node.path };
+    return void 0;
+  } else if (network === "http") {
+    const opts = {};
+    if (node.path)
+      opts.path = [node.path];
+    if (node.host)
+      opts.headers = { Host: [node.host] };
+    return Object.keys(opts).length > 0 ? opts : void 0;
+  }
+  return void 0;
+}
+function toClashVless(node) {
+  const proxy = { name: node.name, type: "vless", server: node.server, port: node.port, uuid: node.uuid, udp: true };
+  const network = node.network || "tcp";
+  if (network !== "tcp")
+    proxy.network = network;
+  if (node.flow && network === "tcp")
+    proxy.flow = node.flow;
+  if (node.security === "reality" || node.pbk) {
+    proxy.tls = true;
+    if (node.sni)
+      proxy.servername = node.sni;
+    if (node.fp)
+      proxy["client-fingerprint"] = node.fp;
+    proxy["reality-opts"] = { "public-key": node.pbk || "", "short-id": node.sid || "" };
+  } else if (node.security === "tls" || node.sni) {
+    proxy.tls = true;
+    if (node.sni)
+      proxy.servername = node.sni;
+    if (node.fp)
+      proxy["client-fingerprint"] = node.fp;
+  }
+  const transport = clashTransportOpts(node, network);
+  if (transport) {
+    proxy[network === "ws" ? "ws-opts" : network === "grpc" ? "grpc-opts" : "http-opts"] = transport;
+  }
+  return proxy;
+}
+function toClashVmess(node) {
+  const proxy = {
+    name: node.name,
+    type: "vmess",
+    server: node.server,
+    port: node.port,
+    uuid: node.uuid,
+    alterId: node.alterId || 0,
+    cipher: node.cipher || "auto",
+    udp: true
+  };
+  const network = node.network || "tcp";
+  if (network !== "tcp")
+    proxy.network = network;
+  if (node.tls || node.sni) {
+    proxy.tls = true;
+    if (node.sni)
+      proxy.servername = node.sni;
+    if (node.fp)
+      proxy["client-fingerprint"] = node.fp;
+  }
+  const transport = clashTransportOpts(node, network);
+  if (transport) {
+    proxy[network === "ws" ? "ws-opts" : network === "grpc" ? "grpc-opts" : "http-opts"] = transport;
+  }
+  return proxy;
+}
+function toClashTrojan(node) {
+  const proxy = {
+    name: node.name,
+    type: "trojan",
+    server: node.server,
+    port: node.port,
+    password: node.password,
+    udp: true
+  };
+  const network = node.network || "tcp";
+  if (network !== "tcp")
+    proxy.network = network;
+  if (node.sni || node.security === "tls")
+    proxy.sni = node.sni || node.server;
+  if (node.allowInsecure)
+    proxy["skip-cert-verify"] = true;
+  if (node.fp)
+    proxy["client-fingerprint"] = node.fp;
+  if (node.alpn)
+    proxy.alpn = node.alpn.split(",").map((s) => s.trim()).filter(Boolean);
+  const transport = clashTransportOpts(node, network);
+  if (transport) {
+    proxy[network === "ws" ? "ws-opts" : network === "grpc" ? "grpc-opts" : "http-opts"] = transport;
+  }
+  return proxy;
+}
+function toClashSs(node) {
+  const proxy = {
+    name: node.name,
+    type: "ss",
+    server: node.server,
+    port: node.port,
+    cipher: node.method,
+    password: node.password,
+    udp: true
+  };
+  if (node.plugin)
+    proxy.plugin = node.plugin;
+  return proxy;
+}
+function toClashHysteria(node) {
+  const proxy = { name: node.name, type: "hysteria", server: node.server, port: node.port, udp: true };
+  proxy.up = node.up ? String(node.up) : "20";
+  proxy.down = node.down ? String(node.down) : "100";
+  if (node.auth)
+    proxy.auth = node.auth;
+  if (node.obfs)
+    proxy.obfs = node.obfs;
+  if (node.obfsParam)
+    proxy["obfs-param"] = node.obfsParam;
+  if (node.protocol)
+    proxy.protocol = node.protocol;
+  if (node.peer || node.sni)
+    proxy.sni = node.peer || node.sni;
+  if (node.insecure)
+    proxy["skip-cert-verify"] = true;
+  if (node.alpn)
+    proxy.alpn = node.alpn.split(",").map((s) => s.trim()).filter(Boolean);
+  return proxy;
+}
+function toClashHy2(node) {
+  const proxy = {
+    name: node.name,
+    type: "hysteria2",
+    server: node.server,
+    port: node.port,
+    password: node.password,
+    udp: true
+  };
+  if (node.up)
+    proxy.up = String(node.up);
+  if (node.down)
+    proxy.down = String(node.down);
+  if (node.sni)
+    proxy.sni = node.sni;
+  if (node.obfs)
+    proxy.obfs = node.obfs;
+  if (node.obfsPassword)
+    proxy["obfs-password"] = node.obfsPassword;
+  if (node.insecure)
+    proxy["skip-cert-verify"] = true;
+  return proxy;
+}
+function toClashTuic(node) {
+  const proxy = {
+    name: node.name,
+    type: "tuic",
+    server: node.server,
+    port: node.port,
+    uuid: node.uuid,
+    password: node.password,
+    udp: true
+  };
+  if (node.congestion)
+    proxy["congestion-controller"] = node.congestion;
+  if (node.udpRelayMode)
+    proxy["udp-relay-mode"] = node.udpRelayMode;
+  if (node.alpn)
+    proxy.alpn = node.alpn.split(",").map((s) => s.trim()).filter(Boolean);
+  if (node.sni)
+    proxy.sni = node.sni;
+  if (node.insecure)
+    proxy["skip-cert-verify"] = true;
+  return proxy;
+}
+function toClashNaive(node) {
+  return {
+    name: node.name,
+    type: "naive",
+    server: node.server,
+    port: node.port,
+    username: node.username,
+    password: node.password,
+    udp: true,
+    tls: true
+  };
+}
+function buildSingboxConfig(nodes) {
+  return { version: 1, outbounds: dedupeNodeNames(nodes).map(toSingboxOutbound).filter(Boolean) };
+}
+function toSingboxOutbound(node) {
+  try {
+    switch (node.type) {
+      case "vless":
+        return singboxVless(node);
+      case "vmess":
+        return singboxVmess(node);
+      case "trojan":
+        return singboxTrojan(node);
+      case "ss":
+        return singboxSs(node);
+      case "hysteria":
+        return singboxHysteria(node);
+      case "hy2":
+        return singboxHy2(node);
+      case "tuic":
+        return singboxTuic(node);
+      case "naive":
+        return singboxNaive(node);
+      default:
+        return null;
+    }
+  } catch (e) {
+    console.error(`\u8F6C\u6362sing-box\u8282\u70B9\u5931\u8D25(${node.name}): ${e.message}`);
+    return null;
+  }
+}
+function singboxTls(node, forceEnabled) {
+  const enabled = forceEnabled || node.security === "reality" || node.pbk || node.security === "tls" || node.sni || node.tls;
+  if (!enabled)
+    return void 0;
+  const tls = { enabled: true };
+  if (node.security === "reality" || node.pbk) {
+    tls.reality = { enabled: true, public_key: node.pbk || "", short_id: node.sid || "" };
+  }
+  if (node.sni)
+    tls.server_name = node.sni;
+  if (node.insecure)
+    tls.insecure = true;
+  if (node.fp)
+    tls.utls = { enabled: true, fingerprint: node.fp };
+  if (node.alpn)
+    tls.alpn = node.alpn.split(",").map((s) => s.trim()).filter(Boolean);
+  return tls;
+}
+function singboxTransport(node) {
+  const network = node.network || "tcp";
+  if (network === "tcp" || network === "")
+    return void 0;
+  if (network === "ws") {
+    const t = { type: "ws" };
+    if (node.path)
+      t.path = node.path;
+    if (node.host)
+      t.headers = { Host: node.host };
+    return t;
+  }
+  if (network === "grpc") {
+    const t = { type: "grpc" };
+    if (node.path)
+      t.service_name = node.path;
+    return t;
+  }
+  if (network === "http") {
+    const t = { type: "http" };
+    if (node.path)
+      t.path = node.path;
+    if (node.host)
+      t.host = node.host;
+    return t;
+  }
+  if (network === "h2" || network === "httpupgrade") {
+    const t = { type: "httpupgrade" };
+    if (node.path)
+      t.path = node.path;
+    if (node.host)
+      t.host = node.host;
+    return t;
+  }
+  return void 0;
+}
+function singboxVless(node) {
+  const ob = { type: "vless", tag: node.name, server: node.server, server_port: node.port, uuid: node.uuid };
+  if (node.flow && (node.network || "tcp") === "tcp")
+    ob.flow = node.flow;
+  ob.packet_encoding = "xudp";
+  const tls = singboxTls(node, false);
+  if (tls)
+    ob.tls = tls;
+  const transport = singboxTransport(node);
+  if (transport)
+    ob.transport = transport;
+  return ob;
+}
+function singboxVmess(node) {
+  const ob = {
+    type: "vmess",
+    tag: node.name,
+    server: node.server,
+    server_port: node.port,
+    uuid: node.uuid,
+    security: node.cipher || "auto"
+  };
+  const tls = singboxTls(node, false);
+  if (tls)
+    ob.tls = tls;
+  const transport = singboxTransport(node);
+  if (transport)
+    ob.transport = transport;
+  return ob;
+}
+function singboxTrojan(node) {
+  const ob = {
+    type: "trojan",
+    tag: node.name,
+    server: node.server,
+    server_port: node.port,
+    password: node.password
+  };
+  const tls = singboxTls(node, true);
+  if (tls)
+    ob.tls = tls;
+  const transport = singboxTransport(node);
+  if (transport)
+    ob.transport = transport;
+  return ob;
+}
+function singboxSs(node) {
+  return {
+    type: "shadowsocks",
+    tag: node.name,
+    server: node.server,
+    server_port: node.port,
+    method: node.method,
+    password: node.password
+  };
+}
+function singboxHysteria(node) {
+  const ob = { type: "hysteria", tag: node.name, server: node.server, server_port: node.port };
+  ob.up_mbps = node.up || 20;
+  ob.down_mbps = node.down || 100;
+  if (node.auth)
+    ob.auth_str = node.auth;
+  if (node.obfs)
+    ob.obfs = node.obfs;
+  if (node.obfsParam)
+    ob.obfs_param = node.obfsParam;
+  if (node.protocol)
+    ob.protocol = node.protocol;
+  const tls = { enabled: true };
+  if (node.peer || node.sni)
+    tls.server_name = node.peer || node.sni;
+  if (node.insecure)
+    tls.insecure = true;
+  if (node.alpn)
+    tls.alpn = node.alpn.split(",").map((s) => s.trim()).filter(Boolean);
+  ob.tls = tls;
+  return ob;
+}
+function singboxHy2(node) {
+  const ob = {
+    type: "hysteria2",
+    tag: node.name,
+    server: node.server,
+    server_port: node.port,
+    password: node.password
+  };
+  if (node.up)
+    ob.up_mbps = node.up;
+  if (node.down)
+    ob.down_mbps = node.down;
+  if (node.obfs || node.obfsPassword) {
+    ob.obfs = { type: node.obfs || "salamander" };
+    if (node.obfsPassword)
+      ob.obfs.password = node.obfsPassword;
+  }
+  const tls = { enabled: true };
+  if (node.sni)
+    tls.server_name = node.sni;
+  if (node.insecure)
+    tls.insecure = true;
+  if (node.alpn)
+    tls.alpn = node.alpn.split(",").map((s) => s.trim()).filter(Boolean);
+  ob.tls = tls;
+  return ob;
+}
+function singboxTuic(node) {
+  const ob = {
+    type: "tuic",
+    tag: node.name,
+    server: node.server,
+    server_port: node.port,
+    uuid: node.uuid,
+    password: node.password
+  };
+  if (node.congestion)
+    ob.congestion_control = node.congestion;
+  if (node.udpRelayMode)
+    ob.udp_relay_mode = node.udpRelayMode;
+  const tls = { enabled: true };
+  if (node.sni)
+    tls.server_name = node.sni;
+  if (node.insecure)
+    tls.insecure = true;
+  if (node.alpn)
+    tls.alpn = node.alpn.split(",").map((s) => s.trim()).filter(Boolean);
+  ob.tls = tls;
+  return ob;
+}
+function singboxNaive(node) {
+  return {
+    type: "naive",
+    tag: node.name,
+    server: node.server,
+    server_port: node.port,
+    username: node.username,
+    password: node.password
+  };
+}
+function normalizeFormat(format) {
+  const f = (format || "").trim().toLowerCase();
+  if (["clash", "clashyaml", "clash-meta", "yaml"].includes(f))
+    return "clash";
+  if (["singbox", "sing-box", "sing_box", "singboxjson", "json"].includes(f))
+    return "singbox";
+  if (["plain", "v2ray", "text", "txt"].includes(f))
+    return "plain";
+  return "base64";
+}
 var worker_default = {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const format = normalizeFormat(url.searchParams.get("format"));
     const cache = globalThis.caches ? caches.default : null;
-    const cacheKey = new Request(request.url, { method: "GET" });
+    url.searchParams.delete("format");
+    url.searchParams.set("_cachev", "2");
+    const dataCacheKey = new Request(url.toString(), { method: "GET" });
+    let linksText = "";
     if (cache) {
       try {
-        const cached = await cache.match(cacheKey);
+        const cached = await cache.match(dataCacheKey);
         if (cached) {
-          return cached;
+          linksText = await cached.text();
         }
       } catch (cacheError) {
         console.error(`\u7F13\u5B58\u8BFB\u53D6\u5931\u8D25: ${cacheError.message}`);
       }
     }
-    try {
-      let resultsArray = await processUrls(targetUrls);
-      let uniqueStrings = [...new Set(resultsArray)];
-      let sortedArray = uniqueStrings.sort((a, b) => {
-        const compareByLetters = a.localeCompare(b);
-        if (compareByLetters === 0) {
-          const numA = parseInt(a, 10) || 0;
-          const numB = parseInt(b, 10) || 0;
-          const compareByNumbers = numA - numB;
-          if (compareByNumbers === 0) {
-            return a.length - b.length;
+    if (linksText === "") {
+      try {
+        let resultsArray = await processUrls(targetUrls);
+        let uniqueStrings = [...new Set(resultsArray)].filter((item) => item !== "");
+        let sortedArray = uniqueStrings.sort((a, b) => {
+          const compareByLetters = a.localeCompare(b);
+          if (compareByLetters === 0) {
+            const numA = parseInt(a, 10) || 0;
+            const numB = parseInt(b, 10) || 0;
+            const compareByNumbers = numA - numB;
+            if (compareByNumbers === 0) {
+              return a.length - b.length;
+            }
+            return compareByNumbers;
           }
-          return compareByNumbers;
+          return compareByLetters;
+        });
+        linksText = sortedArray.join("\n");
+        if (cache) {
+          const dataResponse = new Response(linksText, {
+            headers: { "Cache-Control": "public, max-age=1800, s-maxage=1800" }
+          });
+          ctx.waitUntil(
+            cache.put(dataCacheKey, dataResponse).catch(
+              (cacheError) => console.error(`\u7F13\u5B58\u5199\u5165\u5931\u8D25: ${cacheError.message}`)
+            )
+          );
         }
-        return compareByLetters;
-      });
-      let resultString = sortedArray.join("\n");
-      if (resultString === "") {
-        return new Response("\u83B7\u53D6\u8BA2\u9605\u5931\u8D25: \u6240\u6709\u8BA2\u9605\u6E90\u5747\u4E0D\u53EF\u7528,\u8BF7\u68C0\u67E5 targetUrls \u91CC\u7684\u94FE\u63A5\u662F\u5426\u5931\u6548,\u6216\u7A0D\u540E\u518D\u8BD5\u3002", {
-          status: 200,
-          headers: {
-            "Content-Type": "text/plain; charset=UTF-8"
-          }
+      } catch (error) {
+        console.error(`Error in fetch function: ${error.message}`);
+        return new Response(`Error fetching web page: ${error.message}`, {
+          status: 500
         });
       }
-      let base64String = base64Encode(resultString);
-      const response = new Response(base64String, {
+    }
+    if (linksText === "") {
+      return new Response("\u83B7\u53D6\u8BA2\u9605\u5931\u8D25: \u6240\u6709\u8BA2\u9605\u6E90\u5747\u4E0D\u53EF\u7528,\u8BF7\u68C0\u67E5 targetUrls \u91CC\u7684\u94FE\u63A5\u662F\u5426\u5931\u6548,\u6216\u7A0D\u540E\u518D\u8BD5\u3002", {
         status: 200,
         headers: {
-          "Content-Type": "text/plain; charset=UTF-8",
-          "Cache-Control": "public, max-age=1800, s-maxage=1800"
+          "Content-Type": "text/plain; charset=UTF-8"
         }
       });
-      if (cache) {
-        ctx.waitUntil(
-          cache.put(cacheKey, response.clone()).catch((cacheError) => console.error(`\u7F13\u5B58\u5199\u5165\u5931\u8D25: ${cacheError.message}`))
-        );
-      }
-      return response;
-    } catch (error) {
-      console.error(`Error in fetch function: ${error.message}`);
-      return new Response(`Error fetching web page: ${error.message}`, {
-        status: 500
-      });
     }
+    let body = "";
+    let contentType = "text/plain; charset=UTF-8";
+    if (format === "clash" || format === "singbox") {
+      const nodes = linksText.split("\n").map(parseShareLink).filter(Boolean);
+      if (nodes.length === 0) {
+        return new Response("\u83B7\u53D6\u8BA2\u9605\u5931\u8D25: \u65E0\u6CD5\u89E3\u6790\u4EFB\u4F55\u8282\u70B9\u3002", {
+          status: 200,
+          headers: { "Content-Type": "text/plain; charset=UTF-8" }
+        });
+      }
+      if (format === "clash") {
+        body = js_yaml_default.dump(buildClashConfig(nodes));
+        contentType = "text/yaml; charset=UTF-8";
+      } else {
+        body = JSON.stringify(buildSingboxConfig(nodes), null, 2);
+        contentType = "application/json; charset=UTF-8";
+      }
+    } else if (format === "plain") {
+      body = linksText;
+    } else {
+      body = base64Encode(linksText);
+    }
+    return new Response(body, {
+      status: 200,
+      headers: {
+        "Content-Type": contentType,
+        "Cache-Control": "public, max-age=1800, s-maxage=1800"
+      }
+    });
   }
 };
 export {

@@ -858,89 +858,830 @@ async function processUrls(targetUrls) {
 	return results;
 }
 
+// ----------------------------------- 分享链接解析为统一结构的节点对象 -----------------------------------
+
+// 安全解码URL编码内容(失败时返回原文)
+function safeDecode(str) {
+	try {
+		return decodeURIComponent(str);
+	} catch (e) {
+		return str;
+	}
+}
+
+// 拆分分享链接为 [host:port部分, 查询参数, 节点名]
+function splitShareLink(link) {
+	const hashIndex = link.indexOf('#');
+	const fragment = hashIndex >= 0 ? safeDecode(link.slice(hashIndex + 1)) : '';
+	const beforeHash = hashIndex >= 0 ? link.slice(0, hashIndex) : link;
+	const queryIndex = beforeHash.indexOf('?');
+	const params = new URLSearchParams(queryIndex >= 0 ? beforeHash.slice(queryIndex + 1) : '');
+	const base = queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash;
+	return { base, params, fragment };
+}
+
+// 拆分 host:port,兼容 IPv6 地址
+function splitHostPort(str, defaultPort) {
+	str = str || '';
+	if (str.startsWith('[')) {
+		const end = str.indexOf(']');
+		if (end >= 0) {
+			const host = str.slice(1, end);
+			const rest = str.slice(end + 1);
+			const port = rest.startsWith(':') ? rest.slice(1) : '';
+			return { host, port: port ? parseInt(port, 10) : defaultPort };
+		}
+	}
+	const idx = str.lastIndexOf(':');
+	if (idx >= 0) {
+		return { host: str.slice(0, idx), port: parseInt(str.slice(idx + 1), 10) || defaultPort };
+	}
+	return { host: str, port: defaultPort };
+}
+
+// 将 vmess 的 JSON 对象转换为统一的节点对象
+function vmessNodeFromJson(j) {
+	const name = j.ps || `${j.add}:${j.port}`;
+	return {
+		type: 'vmess',
+		name: name,
+		server: j.add,
+		port: parseInt(j.port, 10) || 443,
+		uuid: j.id,
+		alterId: parseInt(j.aid, 10) || 0,
+		cipher: j.scy || 'auto',
+		network: j.net || 'tcp',
+		headerType: j.type || 'none',
+		host: j.host || '',
+		path: j.path || '/',
+		tls: j.tls === 'tls' || j.tls === true,
+		sni: j.sni || '',
+		alpn: j.alpn || '',
+		fp: j.fp || '',
+	};
+}
+
+// 解析一条分享链接(vless/vmess/trojan/ss/hysteria/hy2/tuic/naive)为统一结构的节点对象
+function parseShareLink(link) {
+	let type = '';
+	if (link.startsWith('vless://')) type = 'vless';
+	else if (link.startsWith('vmess://')) type = 'vmess';
+	else if (link.startsWith('trojan://')) type = 'trojan';
+	else if (link.startsWith('ss://')) type = 'ss';
+	else if (link.startsWith('hysteria://')) type = 'hysteria';
+	else if (link.startsWith('hy2://')) type = 'hy2';
+	else if (link.startsWith('tuic://')) type = 'tuic';
+	else if (link.startsWith('naive+https://')) type = 'naive';
+	if (!type) return null;
+
+	try {
+		const scheme = type === 'naive' ? 'naive+https://' : `${type}://`;
+		const { base, params, fragment } = splitShareLink(link);
+		const rest = base.slice(scheme.length);
+		const atIndex = rest.lastIndexOf('@');
+		// 注意: 没有@时(如旧版vmess://base64json)整个rest都是userinfo,不能截掉最后一个字符
+		const userinfo = atIndex >= 0 ? rest.slice(0, atIndex) : rest;
+		const hostPort = atIndex >= 0 ? rest.slice(atIndex + 1) : rest;
+
+		// vless
+		if (type === 'vless') {
+			const { host, port } = splitHostPort(hostPort, 443);
+			return {
+				type,
+				name: fragment || `${host}:${port}`,
+				server: host,
+				port,
+				uuid: safeDecode(userinfo),
+				flow: params.get('flow') || '',
+				security: params.get('security') || '',
+				sni: params.get('sni') || '',
+				fp: params.get('fp') || '',
+				pbk: params.get('pbk') || '',
+				sid: params.get('sid') || '',
+				network: params.get('type') || 'tcp',
+				host: params.get('host') || '',
+				path: params.get('path') || '',
+				alpn: params.get('alpn') || '',
+			};
+		}
+
+		// vmess(新格式 vmess://uuid@host:port?params 或 旧格式 vmess://base64json)
+		if (type === 'vmess') {
+			if (atIndex >= 0) {
+				const { host, port } = splitHostPort(hostPort, 443);
+				return vmessNodeFromJson({
+					ps: fragment || `${host}:${port}`,
+					add: host,
+					port: port,
+					id: safeDecode(userinfo),
+					aid: params.get('aid') || 0,
+					scy: params.get('scy') || 'auto',
+					net: params.get('type') || 'tcp',
+					type: params.get('headerType') || 'none',
+					host: params.get('host') || '',
+					path: params.get('path') || '/',
+					tls: params.get('security') === 'tls' ? 'tls' : '',
+					sni: params.get('sni') || '',
+					alpn: params.get('alpn') || '',
+					fp: params.get('fp') || '',
+				});
+			}
+			try {
+				return vmessNodeFromJson(JSON.parse(base64Decode(safeDecode(userinfo))));
+			} catch (e) {
+				return null;
+			}
+		}
+
+		// trojan
+		if (type === 'trojan') {
+			const { host, port } = splitHostPort(hostPort, 443);
+			return {
+				type,
+				name: fragment || `${host}:${port}`,
+				server: host,
+				port,
+				password: safeDecode(userinfo),
+				security: params.get('security') || '',
+				sni: params.get('sni') || '',
+				fp: params.get('fp') || '',
+				alpn: params.get('alpn') || '',
+				network: params.get('type') || 'tcp',
+				host: params.get('host') || '',
+				path: params.get('path') || '',
+				allowInsecure: ['1', 'true', 'yes'].includes(
+					(params.get('allowInsecure') || params.get('allow_insecure') || '').toLowerCase()
+				),
+			};
+		}
+
+		// ss
+		if (type === 'ss') {
+			const { host, port } = splitHostPort(hostPort, 8388);
+			let raw = safeDecode(userinfo);
+			// 兼容 ss://base64(method:password) 和 ss://method:password 两种写法(base64字符集不含冒号,不会误伤明文写法)
+			if (isValidBase64(raw)) {
+				raw = base64Decode(raw);
+			}
+			const colonIndex = raw.indexOf(':');
+			const method = colonIndex >= 0 ? raw.slice(0, colonIndex) : raw;
+			const password = colonIndex >= 0 ? raw.slice(colonIndex + 1) : '';
+			return {
+				type,
+				name: fragment || `${host}:${port}`,
+				server: host,
+				port,
+				method,
+				password,
+				plugin: params.get('plugin') || '',
+			};
+		}
+
+		// hysteria(hy1)
+		if (type === 'hysteria') {
+			const { host, port } = splitHostPort(hostPort, 443);
+			const up = params.get('upmbps') || '';
+			const down = params.get('downmbps') || '';
+			return {
+				type,
+				name: fragment || `${host}:${port}`,
+				server: host,
+				port,
+				up: up ? parseInt(String(up).replace(/\D/g, ''), 10) : '',
+				down: down ? parseInt(String(down).replace(/\D/g, ''), 10) : '',
+				obfs: params.get('obfs') || '',
+				obfsParam: params.get('obfsParam') || '',
+				auth: params.get('auth') || params.get('auth_str') || '',
+				protocol: params.get('protocol') || '',
+				insecure: params.get('insecure') === '1',
+				peer: params.get('peer') || '',
+				alpn: params.get('alpn') || '',
+			};
+		}
+
+		// hy2
+		if (type === 'hy2') {
+			const { host, port } = splitHostPort(hostPort, 443);
+			const up = params.get('upmbps') || '';
+			const down = params.get('downmbps') || '';
+			return {
+				type,
+				name: fragment || `${host}:${port}`,
+				server: host,
+				port,
+				password: safeDecode(userinfo),
+				up: up ? parseInt(String(up).replace(/\D/g, ''), 10) : '',
+				down: down ? parseInt(String(down).replace(/\D/g, ''), 10) : '',
+				obfs: params.get('obfs') || '',
+				obfsPassword: params.get('obfs-password') || '',
+				sni: params.get('sni') || '',
+				insecure: params.get('insecure') === '1',
+			};
+		}
+
+		// tuic
+		if (type === 'tuic') {
+			const { host, port } = splitHostPort(hostPort, 443);
+			const colonIndex = userinfo.lastIndexOf(':');
+			return {
+				type,
+				name: fragment || `${host}:${port}`,
+				server: host,
+				port,
+				uuid: safeDecode(colonIndex >= 0 ? userinfo.slice(0, colonIndex) : userinfo),
+				password: colonIndex >= 0 ? safeDecode(userinfo.slice(colonIndex + 1)) : '',
+				congestion: params.get('congestion_control') || '',
+				udpRelayMode: params.get('udp_relay_mode') || '',
+				alpn: params.get('alpn') || '',
+				sni: params.get('sni') || '',
+				insecure: params.get('allow_insecure') === '1',
+			};
+		}
+
+		// naive
+		if (type === 'naive') {
+			const { host, port } = splitHostPort(hostPort, 443);
+			const colonIndex = userinfo.lastIndexOf(':');
+			return {
+				type,
+				name: fragment || `${host}:${port}`,
+				server: host,
+				port,
+				username: safeDecode(colonIndex >= 0 ? userinfo.slice(0, colonIndex) : userinfo),
+				password: colonIndex >= 0 ? safeDecode(userinfo.slice(colonIndex + 1)) : '',
+			};
+		}
+
+		return null;
+	} catch (e) {
+		console.error(`解析分享链接失败: ${e.message}`);
+		return null;
+	}
+}
+
+// ----------------------------------------- 生成 clash(yaml) 订阅 -----------------------------------------
+
+// 节点名去重(相同名字后面加_2、_3,避免clash/sing-box出现重复name/tag)
+function dedupeNodeNames(nodes) {
+	const seen = new Map();
+	return nodes.map((node) => {
+		const baseName = node.name || `${node.server}:${node.port}`;
+		const count = seen.get(baseName) || 0;
+		seen.set(baseName, count + 1);
+		return { ...node, name: count === 0 ? baseName : `${baseName}_${count + 1}` };
+	});
+}
+
+// 构建完整的 clash 配置(proxies + 基本的proxy-groups)
+function buildClashConfig(nodes) {
+	const proxies = dedupeNodeNames(nodes).map(toClashProxy).filter(Boolean);
+	const names = proxies.map((p) => p.name);
+	return {
+		proxies: proxies,
+		'proxy-groups': [
+			{
+				name: '♻️ 自动选择',
+				type: 'url-test',
+				url: 'http://www.gstatic.com/generate_204',
+				interval: 300,
+				proxies: names,
+			},
+			{
+				name: '🚀 节点选择',
+				type: 'select',
+				proxies: ['♻️ 自动选择', ...names],
+			},
+		],
+	};
+}
+
+// 将统一结构的节点对象转换为 clash proxy 对象
+function toClashProxy(node) {
+	try {
+		switch (node.type) {
+			case 'vless':
+				return toClashVless(node);
+			case 'vmess':
+				return toClashVmess(node);
+			case 'trojan':
+				return toClashTrojan(node);
+			case 'ss':
+				return toClashSs(node);
+			case 'hysteria':
+				return toClashHysteria(node);
+			case 'hy2':
+				return toClashHy2(node);
+			case 'tuic':
+				return toClashTuic(node);
+			case 'naive':
+				return toClashNaive(node);
+			default:
+				return null;
+		}
+	} catch (e) {
+		console.error(`转换clash节点失败(${node.name}): ${e.message}`);
+		return null;
+	}
+}
+
+// clash 的 ws/grpc/http 传输配置
+function clashTransportOpts(node, network) {
+	if (network === 'ws') {
+		const opts = {};
+		if (node.path) opts.path = node.path;
+		if (node.host) opts.headers = { Host: node.host };
+		return Object.keys(opts).length > 0 ? opts : undefined;
+	} else if (network === 'grpc') {
+		if (node.path) return { 'grpc-service-name': node.path };
+		return undefined;
+	} else if (network === 'http') {
+		const opts = {};
+		if (node.path) opts.path = [node.path];
+		if (node.host) opts.headers = { Host: [node.host] };
+		return Object.keys(opts).length > 0 ? opts : undefined;
+	}
+	return undefined;
+}
+
+function toClashVless(node) {
+	const proxy = { name: node.name, type: 'vless', server: node.server, port: node.port, uuid: node.uuid, udp: true };
+	const network = node.network || 'tcp';
+	if (network !== 'tcp') proxy.network = network;
+	if (node.flow && network === 'tcp') proxy.flow = node.flow;
+	if (node.security === 'reality' || node.pbk) {
+		proxy.tls = true;
+		if (node.sni) proxy.servername = node.sni;
+		if (node.fp) proxy['client-fingerprint'] = node.fp;
+		proxy['reality-opts'] = { 'public-key': node.pbk || '', 'short-id': node.sid || '' };
+	} else if (node.security === 'tls' || node.sni) {
+		proxy.tls = true;
+		if (node.sni) proxy.servername = node.sni;
+		if (node.fp) proxy['client-fingerprint'] = node.fp;
+	}
+	const transport = clashTransportOpts(node, network);
+	if (transport) {
+		proxy[network === 'ws' ? 'ws-opts' : network === 'grpc' ? 'grpc-opts' : 'http-opts'] = transport;
+	}
+	return proxy;
+}
+
+function toClashVmess(node) {
+	const proxy = {
+		name: node.name,
+		type: 'vmess',
+		server: node.server,
+		port: node.port,
+		uuid: node.uuid,
+		alterId: node.alterId || 0,
+		cipher: node.cipher || 'auto',
+		udp: true,
+	};
+	const network = node.network || 'tcp';
+	if (network !== 'tcp') proxy.network = network;
+	if (node.tls || node.sni) {
+		proxy.tls = true;
+		if (node.sni) proxy.servername = node.sni;
+		if (node.fp) proxy['client-fingerprint'] = node.fp;
+	}
+	const transport = clashTransportOpts(node, network);
+	if (transport) {
+		proxy[network === 'ws' ? 'ws-opts' : network === 'grpc' ? 'grpc-opts' : 'http-opts'] = transport;
+	}
+	return proxy;
+}
+
+function toClashTrojan(node) {
+	const proxy = {
+		name: node.name,
+		type: 'trojan',
+		server: node.server,
+		port: node.port,
+		password: node.password,
+		udp: true,
+	};
+	const network = node.network || 'tcp';
+	if (network !== 'tcp') proxy.network = network;
+	if (node.sni || node.security === 'tls') proxy.sni = node.sni || node.server;
+	if (node.allowInsecure) proxy['skip-cert-verify'] = true;
+	if (node.fp) proxy['client-fingerprint'] = node.fp;
+	if (node.alpn) proxy.alpn = node.alpn.split(',').map((s) => s.trim()).filter(Boolean);
+	const transport = clashTransportOpts(node, network);
+	if (transport) {
+		proxy[network === 'ws' ? 'ws-opts' : network === 'grpc' ? 'grpc-opts' : 'http-opts'] = transport;
+	}
+	return proxy;
+}
+
+function toClashSs(node) {
+	const proxy = {
+		name: node.name,
+		type: 'ss',
+		server: node.server,
+		port: node.port,
+		cipher: node.method,
+		password: node.password,
+		udp: true,
+	};
+	if (node.plugin) proxy.plugin = node.plugin;
+	return proxy;
+}
+
+function toClashHysteria(node) {
+	const proxy = { name: node.name, type: 'hysteria', server: node.server, port: node.port, udp: true };
+	proxy.up = node.up ? String(node.up) : '20';
+	proxy.down = node.down ? String(node.down) : '100';
+	if (node.auth) proxy.auth = node.auth;
+	if (node.obfs) proxy.obfs = node.obfs;
+	if (node.obfsParam) proxy['obfs-param'] = node.obfsParam;
+	if (node.protocol) proxy.protocol = node.protocol;
+	if (node.peer || node.sni) proxy.sni = node.peer || node.sni;
+	if (node.insecure) proxy['skip-cert-verify'] = true;
+	if (node.alpn) proxy.alpn = node.alpn.split(',').map((s) => s.trim()).filter(Boolean);
+	return proxy;
+}
+
+function toClashHy2(node) {
+	const proxy = {
+		name: node.name,
+		type: 'hysteria2',
+		server: node.server,
+		port: node.port,
+		password: node.password,
+		udp: true,
+	};
+	if (node.up) proxy.up = String(node.up);
+	if (node.down) proxy.down = String(node.down);
+	if (node.sni) proxy.sni = node.sni;
+	if (node.obfs) proxy.obfs = node.obfs;
+	if (node.obfsPassword) proxy['obfs-password'] = node.obfsPassword;
+	if (node.insecure) proxy['skip-cert-verify'] = true;
+	return proxy;
+}
+
+function toClashTuic(node) {
+	const proxy = {
+		name: node.name,
+		type: 'tuic',
+		server: node.server,
+		port: node.port,
+		uuid: node.uuid,
+		password: node.password,
+		udp: true,
+	};
+	if (node.congestion) proxy['congestion-controller'] = node.congestion;
+	if (node.udpRelayMode) proxy['udp-relay-mode'] = node.udpRelayMode;
+	if (node.alpn) proxy.alpn = node.alpn.split(',').map((s) => s.trim()).filter(Boolean);
+	if (node.sni) proxy.sni = node.sni;
+	if (node.insecure) proxy['skip-cert-verify'] = true;
+	return proxy;
+}
+
+function toClashNaive(node) {
+	return {
+		name: node.name,
+		type: 'naive',
+		server: node.server,
+		port: node.port,
+		username: node.username,
+		password: node.password,
+		udp: true,
+		tls: true,
+	};
+}
+
+// ---------------------------------------- 生成 sing-box(json) 订阅 ----------------------------------------
+
+function buildSingboxConfig(nodes) {
+	return { version: 1, outbounds: dedupeNodeNames(nodes).map(toSingboxOutbound).filter(Boolean) };
+}
+
+// 将统一结构的节点对象转换为 sing-box outbound 对象
+function toSingboxOutbound(node) {
+	try {
+		switch (node.type) {
+			case 'vless':
+				return singboxVless(node);
+			case 'vmess':
+				return singboxVmess(node);
+			case 'trojan':
+				return singboxTrojan(node);
+			case 'ss':
+				return singboxSs(node);
+			case 'hysteria':
+				return singboxHysteria(node);
+			case 'hy2':
+				return singboxHy2(node);
+			case 'tuic':
+				return singboxTuic(node);
+			case 'naive':
+				return singboxNaive(node);
+			default:
+				return null;
+		}
+	} catch (e) {
+		console.error(`转换sing-box节点失败(${node.name}): ${e.message}`);
+		return null;
+	}
+}
+
+// 构建 sing-box 的 tls 对象(forceEnabled为true时强制开启tls,如trojan/hysteria等必须开启tls的协议)
+function singboxTls(node, forceEnabled) {
+	const enabled =
+		forceEnabled || node.security === 'reality' || node.pbk || node.security === 'tls' || node.sni || node.tls;
+	if (!enabled) return undefined;
+	const tls = { enabled: true };
+	if (node.security === 'reality' || node.pbk) {
+		tls.reality = { enabled: true, public_key: node.pbk || '', short_id: node.sid || '' };
+	}
+	if (node.sni) tls.server_name = node.sni;
+	if (node.insecure) tls.insecure = true;
+	if (node.fp) tls.utls = { enabled: true, fingerprint: node.fp };
+	if (node.alpn) tls.alpn = node.alpn.split(',').map((s) => s.trim()).filter(Boolean);
+	return tls;
+}
+
+// 构建 sing-box 的 transport 对象
+function singboxTransport(node) {
+	const network = node.network || 'tcp';
+	if (network === 'tcp' || network === '') return undefined;
+	if (network === 'ws') {
+		const t = { type: 'ws' };
+		if (node.path) t.path = node.path;
+		if (node.host) t.headers = { Host: node.host };
+		return t;
+	}
+	if (network === 'grpc') {
+		const t = { type: 'grpc' };
+		if (node.path) t.service_name = node.path;
+		return t;
+	}
+	if (network === 'http') {
+		const t = { type: 'http' };
+		if (node.path) t.path = node.path;
+		if (node.host) t.host = node.host;
+		return t;
+	}
+	if (network === 'h2' || network === 'httpupgrade') {
+		const t = { type: 'httpupgrade' };
+		if (node.path) t.path = node.path;
+		if (node.host) t.host = node.host;
+		return t;
+	}
+	return undefined;
+}
+
+function singboxVless(node) {
+	const ob = { type: 'vless', tag: node.name, server: node.server, server_port: node.port, uuid: node.uuid };
+	if (node.flow && (node.network || 'tcp') === 'tcp') ob.flow = node.flow;
+	ob.packet_encoding = 'xudp';
+	const tls = singboxTls(node, false);
+	if (tls) ob.tls = tls;
+	const transport = singboxTransport(node);
+	if (transport) ob.transport = transport;
+	return ob;
+}
+
+function singboxVmess(node) {
+	const ob = {
+		type: 'vmess',
+		tag: node.name,
+		server: node.server,
+		server_port: node.port,
+		uuid: node.uuid,
+		security: node.cipher || 'auto',
+	};
+	const tls = singboxTls(node, false);
+	if (tls) ob.tls = tls;
+	const transport = singboxTransport(node);
+	if (transport) ob.transport = transport;
+	return ob;
+}
+
+function singboxTrojan(node) {
+	const ob = {
+		type: 'trojan',
+		tag: node.name,
+		server: node.server,
+		server_port: node.port,
+		password: node.password,
+	};
+	const tls = singboxTls(node, true);
+	if (tls) ob.tls = tls;
+	const transport = singboxTransport(node);
+	if (transport) ob.transport = transport;
+	return ob;
+}
+
+function singboxSs(node) {
+	return {
+		type: 'shadowsocks',
+		tag: node.name,
+		server: node.server,
+		server_port: node.port,
+		method: node.method,
+		password: node.password,
+	};
+}
+
+function singboxHysteria(node) {
+	const ob = { type: 'hysteria', tag: node.name, server: node.server, server_port: node.port };
+	// 与clash侧保持一致,缺失时给默认值,避免sing-box缺少up/down
+	ob.up_mbps = node.up || 20;
+	ob.down_mbps = node.down || 100;
+	if (node.auth) ob.auth_str = node.auth;
+	if (node.obfs) ob.obfs = node.obfs;
+	if (node.obfsParam) ob.obfs_param = node.obfsParam;
+	if (node.protocol) ob.protocol = node.protocol;
+	const tls = { enabled: true };
+	if (node.peer || node.sni) tls.server_name = node.peer || node.sni;
+	if (node.insecure) tls.insecure = true;
+	if (node.alpn) tls.alpn = node.alpn.split(',').map((s) => s.trim()).filter(Boolean);
+	ob.tls = tls;
+	return ob;
+}
+
+function singboxHy2(node) {
+	const ob = {
+		type: 'hysteria2',
+		tag: node.name,
+		server: node.server,
+		server_port: node.port,
+		password: node.password,
+	};
+	if (node.up) ob.up_mbps = node.up;
+	if (node.down) ob.down_mbps = node.down;
+	if (node.obfs || node.obfsPassword) {
+		ob.obfs = { type: node.obfs || 'salamander' };
+		if (node.obfsPassword) ob.obfs.password = node.obfsPassword;
+	}
+	const tls = { enabled: true };
+	if (node.sni) tls.server_name = node.sni;
+	if (node.insecure) tls.insecure = true;
+	if (node.alpn) tls.alpn = node.alpn.split(',').map((s) => s.trim()).filter(Boolean);
+	ob.tls = tls;
+	return ob;
+}
+
+function singboxTuic(node) {
+	const ob = {
+		type: 'tuic',
+		tag: node.name,
+		server: node.server,
+		server_port: node.port,
+		uuid: node.uuid,
+		password: node.password,
+	};
+	if (node.congestion) ob.congestion_control = node.congestion;
+	if (node.udpRelayMode) ob.udp_relay_mode = node.udpRelayMode;
+	const tls = { enabled: true };
+	if (node.sni) tls.server_name = node.sni;
+	if (node.insecure) tls.insecure = true;
+	if (node.alpn) tls.alpn = node.alpn.split(',').map((s) => s.trim()).filter(Boolean);
+	ob.tls = tls;
+	return ob;
+}
+
+function singboxNaive(node) {
+	return {
+		type: 'naive',
+		tag: node.name,
+		server: node.server,
+		server_port: node.port,
+		username: node.username,
+		password: node.password,
+	};
+}
+
+// 规范化 format 参数: base64(默认) | plain | clash | singbox
+function normalizeFormat(format) {
+	const f = (format || '').trim().toLowerCase();
+	if (['clash', 'clashyaml', 'clash-meta', 'yaml'].includes(f)) return 'clash';
+	if (['singbox', 'sing-box', 'sing_box', 'singboxjson', 'json'].includes(f)) return 'singbox';
+	if (['plain', 'v2ray', 'text', 'txt'].includes(f)) return 'plain';
+	return 'base64';
+}
+
 // ----------------------------------------- Cloudflare worker 入口 ----------------------------------------
 
 export default {
 	async fetch(request, env, ctx) {
-		// ---- 使用 Cache API 缓存最终结果30分钟,避免每次访问都重新抓取所有订阅源(省时且降低Cloudflare限额风险) ----
+		// ---- 解析请求参数: 支持 ?format=base64|plain|clash|singbox ----
+		const url = new URL(request.url);
+		const format = normalizeFormat(url.searchParams.get('format'));
+
+		// ---- 使用 Cache API 缓存抓取到的节点数据30分钟,各格式共用同一份数据,避免重复抓取源订阅 ----
+		// 缓存键去掉format参数并带版本号(数据结构变更时+1,避免命中旧版本缓存导致解析出错)
 		// 本地node环境没有caches对象,做一下判断避免报错
 		const cache = globalThis.caches ? caches.default : null;
-		const cacheKey = new Request(request.url, { method: 'GET' });
+		url.searchParams.delete('format');
+		url.searchParams.set('_cachev', '2');
+		const dataCacheKey = new Request(url.toString(), { method: 'GET' });
+
+		let linksText = '';
 		if (cache) {
 			try {
-				const cached = await cache.match(cacheKey);
+				const cached = await cache.match(dataCacheKey);
 				if (cached) {
-					return cached;
+					linksText = await cached.text();
 				}
 			} catch (cacheError) {
 				console.error(`缓存读取失败: ${cacheError.message}`);
 			}
 		}
 
-		try {
-			// 调用函数并处理结果
-			let resultsArray = await processUrls(targetUrls);
+		if (linksText === '') {
+			try {
+				// 调用函数并处理结果
+				let resultsArray = await processUrls(targetUrls);
 
-			// 使用Set数据结构的特性去重（再次去重）
-			let uniqueStrings = [...new Set(resultsArray)];
+				// 使用Set数据结构的特性去重（再次去重）,并剔除空字符串
+				let uniqueStrings = [...new Set(resultsArray)].filter((item) => item !== '');
 
-			// 排序
-			let sortedArray = uniqueStrings.sort((a, b) => {
-				// 先按字母顺序排序
-				const compareByLetters = a.localeCompare(b);
-				// 如果字母相同，则按数字大小排序
-				if (compareByLetters === 0) {
-					const numA = parseInt(a, 10) || 0; // 将非数字的字符串转换为0
-					const numB = parseInt(b, 10) || 0;
-					const compareByNumbers = numA - numB;
+				// 排序
+				let sortedArray = uniqueStrings.sort((a, b) => {
+					// 先按字母顺序排序
+					const compareByLetters = a.localeCompare(b);
+					// 如果字母相同，则按数字大小排序
+					if (compareByLetters === 0) {
+						const numA = parseInt(a, 10) || 0; // 将非数字的字符串转换为0
+						const numB = parseInt(b, 10) || 0;
+						const compareByNumbers = numA - numB;
 
-					// 如果数字相同，则按字符串长度排序
-					if (compareByNumbers === 0) {
-						return a.length - b.length;
+						// 如果数字相同，则按字符串长度排序
+						if (compareByNumbers === 0) {
+							return a.length - b.length;
+						}
+						return compareByNumbers;
 					}
-					return compareByNumbers;
+					return compareByLetters;
+				});
+
+				// 将数组拼接成一个字符串
+				linksText = sortedArray.join('\n');
+
+				// 把节点数据写入缓存(失败不影响正常返回,用.catch兜底异步异常)
+				if (cache) {
+					const dataResponse = new Response(linksText, {
+						headers: { 'Cache-Control': 'public, max-age=1800, s-maxage=1800' },
+					});
+					ctx.waitUntil(
+						cache.put(dataCacheKey, dataResponse).catch((cacheError) =>
+							console.error(`缓存写入失败: ${cacheError.message}`)
+						)
+					);
 				}
-				return compareByLetters;
-			});
-
-			// 将数组拼接成一个字符串
-			let resultString = sortedArray.join('\n');
-
-			// 一个节点都没有时,返回可读的错误提示而不是空内容,方便排查问题
-			if (resultString === '') {
-				return new Response('获取订阅失败: 所有订阅源均不可用,请检查 targetUrls 里的链接是否失效,或稍后再试。', {
-					status: 200,
-					headers: {
-						'Content-Type': 'text/plain; charset=UTF-8',
-					},
+			} catch (error) {
+				console.error(`Error in fetch function: ${error.message}`);
+				// 返回一个带有错误信息的响应
+				return new Response(`Error fetching web page: ${error.message}`, {
+					status: 500,
 				});
 			}
+		}
 
-			let base64String = base64Encode(resultString);
-
-			// 返回一个带有结果的响应(同时让Cloudflare边缘与客户端缓存30分钟)
-			const response = new Response(base64String, {
+		// 一个节点都没有时,返回可读的错误提示而不是空内容,方便排查问题
+		if (linksText === '') {
+			return new Response('获取订阅失败: 所有订阅源均不可用,请检查 targetUrls 里的链接是否失效,或稍后再试。', {
 				status: 200,
 				headers: {
 					'Content-Type': 'text/plain; charset=UTF-8',
-					'Cache-Control': 'public, max-age=1800, s-maxage=1800',
 				},
 			});
-
-			// 写入缓存(失败不影响正常返回,用.catch兜底异步异常)
-			if (cache) {
-				ctx.waitUntil(
-					cache.put(cacheKey, response.clone()).catch((cacheError) => console.error(`缓存写入失败: ${cacheError.message}`))
-				);
-			}
-
-			return response;
-		} catch (error) {
-			console.error(`Error in fetch function: ${error.message}`);
-			// 返回一个带有错误信息的响应
-			return new Response(`Error fetching web page: ${error.message}`, {
-				status: 500,
-			});
 		}
+
+		// ---- 根据 format 参数在本地生成对应格式的订阅内容 ----
+		let body = '';
+		let contentType = 'text/plain; charset=UTF-8';
+		if (format === 'clash' || format === 'singbox') {
+			const nodes = linksText.split('\n').map(parseShareLink).filter(Boolean);
+			if (nodes.length === 0) {
+				return new Response('获取订阅失败: 无法解析任何节点。', {
+					status: 200,
+					headers: { 'Content-Type': 'text/plain; charset=UTF-8' },
+				});
+			}
+			if (format === 'clash') {
+				body = yaml.dump(buildClashConfig(nodes));
+				contentType = 'text/yaml; charset=UTF-8';
+			} else {
+				body = JSON.stringify(buildSingboxConfig(nodes), null, 2);
+				contentType = 'application/json; charset=UTF-8';
+			}
+		} else if (format === 'plain') {
+			// 明文v2ray分享链接
+			body = linksText;
+		} else {
+			// base64编码的v2ray分享链接(默认)
+			body = base64Encode(linksText);
+		}
+
+		// 返回一个带有结果的响应(同时让Cloudflare边缘与客户端缓存30分钟)
+		return new Response(body, {
+			status: 200,
+			headers: {
+				'Content-Type': contentType,
+				'Cache-Control': 'public, max-age=1800, s-maxage=1800',
+			},
+		});
 	},
 };
