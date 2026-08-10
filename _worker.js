@@ -1,3 +1,5 @@
+// src/worker.js
+
 // node_modules/js-yaml/dist/js-yaml.mjs
 function isNothing(subject) {
   return typeof subject === "undefined" || subject === null;
@@ -3001,12 +3003,15 @@ function findFieldValue(obj, targetField) {
 }
 async function fetchWebPageContent(url) {
   try {
-    let response = await fetch(url);
+    let response = await fetch(url, { signal: AbortSignal.timeout(8e3), redirect: "follow" });
     if (!response.ok) {
       throw new Error(`\u83B7\u53D6\u5931\u8D25: ${response.status}`);
     }
     let content = (await response.text()).replace(/!<str>/g, "");
-    return stripHtmlTags(content);
+    if (/<[a-z][^>]*>/i.test(content)) {
+      content = stripHtmlTags(content);
+    }
+    return content;
   } catch (error) {
     console.error(`\u83B7\u53D6${url} \u7F51\u9875\u5185\u5BB9\u5931\u8D25: ${error.message}`);
     return "";
@@ -3024,6 +3029,28 @@ function stripHtmlTags(str2) {
   );
   let replaced = str2.replace(regex, (match) => entities[match]);
   return replaced.replace(/<[^>]*>/g, "");
+}
+function splitClashDuplicated(content) {
+  const lines = content.split(/\r?\n/);
+  const chunks = [];
+  let current = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const line of lines) {
+    const match = line.match(/^([A-Za-z0-9_-]+):\s*/);
+    if (match && seen.has(match[1])) {
+      chunks.push(current.join("\n"));
+      current = [];
+      seen.clear();
+    }
+    if (match) {
+      seen.add(match[1]);
+    }
+    current.push(line);
+  }
+  if (current.length > 0) {
+    chunks.push(current.join("\n"));
+  }
+  return chunks;
 }
 async function fetchAndProcessUrl(url) {
   const content = await fetchWebPageContent(url);
@@ -3054,12 +3081,33 @@ async function fetchAndProcessUrl(url) {
       return uniqueArray;
     } else {
       try {
-        let yamlObject = js_yaml_default.load(content);
-        if (yamlObject && typeof yamlObject === "object") {
-          outbounds = findFieldValue(yamlObject, "proxies");
+        let yamlObjects = [];
+        try {
+          yamlObjects = js_yaml_default.loadAll(content);
+        } catch (loadAllError) {
+          for (const chunk of splitClashDuplicated(content)) {
+            try {
+              const obj = js_yaml_default.load(chunk);
+              if (obj && typeof obj === "object") {
+                yamlObjects.push(obj);
+              }
+            } catch (chunkError) {
+            }
+          }
+        }
+        let mergedProxies = [];
+        for (const obj of yamlObjects) {
+          if (obj && typeof obj === "object") {
+            const ps = findFieldValue(obj, "proxies");
+            if (Array.isArray(ps)) {
+              mergedProxies.push(...ps);
+            }
+          }
+        }
+        if (mergedProxies.length > 0) {
+          outbounds = mergedProxies;
         }
       } catch (yamlError) {
-        // \u89E3\u6790yaml\u5931\u8D25(\u4F8B\u5982\u6E90\u6570\u636E\u662F\u635F\u574F\u7684json/yaml)\uFF0C\u8DF3\u8FC7\u8BE5\u94FE\u63A5\uFF0C\u4E0D\u5F71\u54CD\u5176\u5B83\u94FE\u63A5
         console.error(`\u89E3\u6790${url} \u7684yaml\u5185\u5BB9\u5931\u8D25: ${yamlError.message}`);
       }
     }
@@ -3131,7 +3179,7 @@ async function fetchAndProcessUrl(url) {
         if (hy1) {
           uniqueSet.add(hy1);
         }
-      } else if (proxyType === base64Decode("aHky")) {
+      } else if (proxyType === base64Decode("aHky") || proxyType === "hysteria2") {
         let hy2 = parse_hy2(outbounds[i]);
         if (hy2) {
           uniqueSet.add(hy2);
@@ -3190,13 +3238,14 @@ function isValidBase64(str2) {
   str2 = str2.trim();
   if (str2 === "")
     return false;
+  const cleaned = str2.replace(/\s+/g, "");
   const base64Regex = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-  if (!base64Regex.test(str2))
+  if (!base64Regex.test(cleaned))
     return false;
-  if (str2.length % 4 !== 0)
+  if (cleaned.length % 4 !== 0)
     return false;
   try {
-    const binaryStr = atob(str2);
+    const binaryStr = atob(cleaned);
     new Uint8Array([...binaryStr].map((c) => c.charCodeAt(0)));
     return true;
   } catch (e) {
@@ -3221,7 +3270,7 @@ function v2rayLinksHandle(str2) {
     return "";
   }
   try {
-    return base64Decode(str2);
+    return base64Decode(str2.replace(/\s+/g, ""));
   } catch (e) {
     return "";
   }
@@ -3256,7 +3305,7 @@ var targetUrls = [
 ];
 async function processUrls(targetUrls2) {
   const results = [];
-  const maxConcurrency = 3;
+  const maxConcurrency = 8;
   const asyncPool = async (poolLimit, array, iteratorFn) => {
     const results2 = [];
     const executing = [];
@@ -3285,7 +3334,6 @@ async function processUrls(targetUrls2) {
         results.push(link);
       }
     } catch (error) {
-      // \u5355\u4E2A\u94FE\u63A5\u5904\u7406\u5931\u8D25(\u89E3\u6790\u5D29\u6E83\u7B49)\u4E0D\u5F71\u54CD\u5176\u5B83\u94FE\u63A5\uFF0C\u4FDD\u8BC1\u6574\u4E2Aworker\u6B63\u5E38\u8FD4\u56DE
       console.error(`\u5904\u7406${url} \u5931\u8D25: ${error.message}`);
     }
   });
@@ -3293,6 +3341,18 @@ async function processUrls(targetUrls2) {
 }
 var worker_default = {
   async fetch(request, env, ctx) {
+    const cache = globalThis.caches ? caches.default : null;
+    const cacheKey = new Request(request.url, { method: "GET" });
+    if (cache) {
+      try {
+        const cached = await cache.match(cacheKey);
+        if (cached) {
+          return cached;
+        }
+      } catch (cacheError) {
+        console.error(`\u7F13\u5B58\u8BFB\u53D6\u5931\u8D25: ${cacheError.message}`);
+      }
+    }
     try {
       let resultsArray = await processUrls(targetUrls);
       let uniqueStrings = [...new Set(resultsArray)];
@@ -3310,13 +3370,28 @@ var worker_default = {
         return compareByLetters;
       });
       let resultString = sortedArray.join("\n");
+      if (resultString === "") {
+        return new Response("\u83B7\u53D6\u8BA2\u9605\u5931\u8D25: \u6240\u6709\u8BA2\u9605\u6E90\u5747\u4E0D\u53EF\u7528,\u8BF7\u68C0\u67E5 targetUrls \u91CC\u7684\u94FE\u63A5\u662F\u5426\u5931\u6548,\u6216\u7A0D\u540E\u518D\u8BD5\u3002", {
+          status: 200,
+          headers: {
+            "Content-Type": "text/plain; charset=UTF-8"
+          }
+        });
+      }
       let base64String = base64Encode(resultString);
-      return new Response(base64String, {
+      const response = new Response(base64String, {
         status: 200,
         headers: {
-          "Content-Type": "text/plain; charset=UTF-8"
+          "Content-Type": "text/plain; charset=UTF-8",
+          "Cache-Control": "public, max-age=1800, s-maxage=1800"
         }
       });
+      if (cache) {
+        ctx.waitUntil(
+          cache.put(cacheKey, response.clone()).catch((cacheError) => console.error(`\u7F13\u5B58\u5199\u5165\u5931\u8D25: ${cacheError.message}`))
+        );
+      }
+      return response;
     } catch (error) {
       console.error(`Error in fetch function: ${error.message}`);
       return new Response(`Error fetching web page: ${error.message}`, {
@@ -3333,4 +3408,3 @@ export {
 js-yaml/dist/js-yaml.mjs:
   (*! js-yaml 4.1.0 https://github.com/nodeca/js-yaml @license MIT *)
 */
-//# sourceMappingURL=worker.js.map

@@ -388,8 +388,8 @@ function findFieldValue(obj, targetField) {
 
 async function fetchWebPageContent(url) {
 	try {
-		// 发送请求
-		let response = await fetch(url);
+		// 发送请求(8秒超时,防止个别源站挂起拖垮整个worker,免费版单次请求墙钟时间只有30秒)
+		let response = await fetch(url, { signal: AbortSignal.timeout(8000), redirect: 'follow' });
 
 		if (!response.ok) {
 			throw new Error(`获取失败: ${response.status}`);
@@ -398,8 +398,11 @@ async function fetchWebPageContent(url) {
 		// 读取并返回文本内容，同时替换可能出现的"!<str>"字符
 		let content = (await response.text()).replace(/!<str>/g, '');
 
-		// 去掉HTML标签，包括HTML实体字符
-		return stripHtmlTags(content);
+		// 仅当内容明显是HTML时才去掉标签,避免误伤json/yaml/base64订阅数据中可能出现的<>字符
+		if (/<[a-z][^>]*>/i.test(content)) {
+			content = stripHtmlTags(content);
+		}
+		return content;
 	} catch (error) {
 		console.error(`获取${url} 网页内容失败: ${error.message}`);
 		return '';
@@ -426,6 +429,30 @@ function stripHtmlTags(str) {
 	let replaced = str.replace(regex, (match) => entities[match]);
 	// 去掉HTML标签
 	return replaced.replace(/<[^>]*>/g, '');
+}
+
+// 拆分拼接在一起的clash聚合配置:顶层key重复出现的位置就是下一份配置的起点
+function splitClashDuplicated(content) {
+	const lines = content.split(/\r?\n/);
+	const chunks = [];
+	let current = [];
+	const seen = new Set();
+	for (const line of lines) {
+		const match = line.match(/^([A-Za-z0-9_-]+):\s*/);
+		if (match && seen.has(match[1])) {
+			chunks.push(current.join('\n'));
+			current = [];
+			seen.clear();
+		}
+		if (match) {
+			seen.add(match[1]);
+		}
+		current.push(line);
+	}
+	if (current.length > 0) {
+		chunks.push(current.join('\n'));
+	}
+	return chunks;
 }
 
 // ---------------------------------- 去抓取网页、处理节点，返回节点的分享链接 ----------------------------------
@@ -461,9 +488,34 @@ async function fetchAndProcessUrl(url) {
 			return uniqueArray;
 		} else {
 			try {
-				let yamlObject = yaml.load(content); // 使用js-yaml库解析yaml
-				if (yamlObject && typeof yamlObject === 'object') {
-					outbounds = findFieldValue(yamlObject, 'proxies');
+				// 聚合配置常见两种形态:1)用---分隔的多文档;2)直接拼接(顶层key重复,js-yaml会报错)。
+				// 先用loadAll处理多文档,失败再按顶层key重复边界拆分逐个解析,最后合并proxies节点
+				let yamlObjects = [];
+				try {
+					yamlObjects = yaml.loadAll(content);
+				} catch (loadAllError) {
+					for (const chunk of splitClashDuplicated(content)) {
+						try {
+							const obj = yaml.load(chunk);
+							if (obj && typeof obj === 'object') {
+								yamlObjects.push(obj);
+							}
+						} catch (chunkError) {
+							// 单个块解析失败忽略,不影响其它块
+						}
+					}
+				}
+				let mergedProxies = [];
+				for (const obj of yamlObjects) {
+					if (obj && typeof obj === 'object') {
+						const ps = findFieldValue(obj, 'proxies');
+						if (Array.isArray(ps)) {
+							mergedProxies.push(...ps);
+						}
+					}
+				}
+				if (mergedProxies.length > 0) {
+					outbounds = mergedProxies;
 				}
 			} catch (yamlError) {
 				// 解析yaml失败(例如源数据是损坏的json/yaml)，跳过该链接，不影响其它链接
@@ -573,8 +625,8 @@ async function fetchAndProcessUrl(url) {
 				if (hy1) {
 					uniqueSet.add(hy1);
 				}
-				// 检查到是hy2类型的节点
-			} else if (proxyType === base64Decode('aHky')) {
+				// 检查到是hy2类型的节点(clash中该类型名为hysteria2,也要兼容)
+			} else if (proxyType === base64Decode('aHky') || proxyType === 'hysteria2') {
 				let hy2 = parse_hy2(outbounds[i]);
 				if (hy2) {
 					uniqueSet.add(hy2);
@@ -651,16 +703,19 @@ function isValidBase64(str) {
 	str = str.trim();
 	if (str === '') return false;
 
+	// 兼容多行base64订阅:去除所有空白字符后再校验
+	const cleaned = str.replace(/\s+/g, '');
+
 	// Base64正则匹配规则，确保格式正确
 	const base64Regex = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-	if (!base64Regex.test(str)) return false;
+	if (!base64Regex.test(cleaned)) return false;
 
 	// 长度必须是4的倍数
-	if (str.length % 4 !== 0) return false;
+	if (cleaned.length % 4 !== 0) return false;
 
 	try {
 		// 尝试解码，确保不会报错
-		const binaryStr = atob(str);
+		const binaryStr = atob(cleaned);
 		new Uint8Array([...binaryStr].map((c) => c.charCodeAt(0)));
 		return true;
 	} catch (e) {
@@ -692,7 +747,7 @@ function v2rayLinksHandle(str) {
 	}
 
 	try {
-		return base64Decode(str);
+		return base64Decode(str.replace(/\s+/g, ''));
 	} catch (e) {
 		return ''; // 如果解码失败，也返回空字符串
 	}
@@ -742,8 +797,8 @@ const targetUrls = [
 
 async function processUrls(targetUrls) {
 	const results = [];
-	// 最大并发数
-	const maxConcurrency = 3;
+	// 最大并发数(8以内安全,避免触发Too many subrequests错误)
+	const maxConcurrency = 8;
 	// 辅助函数，限制并发执行的异步任务数量
 	const asyncPool = async (poolLimit, array, iteratorFn) => {
 		const results = [];
@@ -791,6 +846,21 @@ async function processUrls(targetUrls) {
 
 export default {
 	async fetch(request, env, ctx) {
+		// ---- 使用 Cache API 缓存最终结果30分钟,避免每次访问都重新抓取所有订阅源(省时且降低Cloudflare限额风险) ----
+		// 本地node环境没有caches对象,做一下判断避免报错
+		const cache = globalThis.caches ? caches.default : null;
+		const cacheKey = new Request(request.url, { method: 'GET' });
+		if (cache) {
+			try {
+				const cached = await cache.match(cacheKey);
+				if (cached) {
+					return cached;
+				}
+			} catch (cacheError) {
+				console.error(`缓存读取失败: ${cacheError.message}`);
+			}
+		}
+
 		try {
 			// 调用函数并处理结果
 			let resultsArray = await processUrls(targetUrls);
@@ -819,15 +889,36 @@ export default {
 
 			// 将数组拼接成一个字符串
 			let resultString = sortedArray.join('\n');
+
+			// 一个节点都没有时,返回可读的错误提示而不是空内容,方便排查问题
+			if (resultString === '') {
+				return new Response('获取订阅失败: 所有订阅源均不可用,请检查 targetUrls 里的链接是否失效,或稍后再试。', {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/plain; charset=UTF-8',
+					},
+				});
+			}
+
 			let base64String = base64Encode(resultString);
 
-			// 返回一个带有结果的响应
-			return new Response(base64String, {
+			// 返回一个带有结果的响应(同时让Cloudflare边缘与客户端缓存30分钟)
+			const response = new Response(base64String, {
 				status: 200,
 				headers: {
 					'Content-Type': 'text/plain; charset=UTF-8',
+					'Cache-Control': 'public, max-age=1800, s-maxage=1800',
 				},
 			});
+
+			// 写入缓存(失败不影响正常返回,用.catch兜底异步异常)
+			if (cache) {
+				ctx.waitUntil(
+					cache.put(cacheKey, response.clone()).catch((cacheError) => console.error(`缓存写入失败: ${cacheError.message}`))
+				);
+			}
+
+			return response;
 		} catch (error) {
 			console.error(`Error in fetch function: ${error.message}`);
 			// 返回一个带有错误信息的响应
