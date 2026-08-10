@@ -2716,8 +2716,10 @@ function parse_hysteria(outbounds_n) {
   let alpn;
   if (typeof alpnValue === "string") {
     alpn = alpnValue;
-  } else {
+  } else if (Array.isArray(alpnValue) && alpnValue.length > 0) {
     alpn = alpnValue.length === 1 ? alpnValue[0].toString() : alpnValue.join(",");
+  } else {
+    alpn = "";
   }
   let hysteriaDict = {
     upmbps,
@@ -2924,10 +2926,10 @@ function parse_tr0jan(outbounds_n) {
   return `${base64Decode("dHJvamFuOi8v")}${password}@${server}:${port}?${encodedParams}#[${base64Decode("dHJvamFu")}]_${server}`;
 }
 function parse_tuic(outbounds_n) {
-  let uuid = findFieldValue(outbounds_n, "uuid");
-  let password = findFieldValue(outbounds_n, "password");
+  let uuid = findFieldValue(outbounds_n, "uuid") || "";
+  let password = findFieldValue(outbounds_n, "password") || "";
   let server = findFieldValue(outbounds_n, "server") || "";
-  if (server === "127.0.0.1" || server === "") {
+  if (server === "127.0.0.1" || server === "" || uuid === "" || password === "") {
     return "";
   }
   let port = findFieldValue(outbounds_n, "port");
@@ -2936,10 +2938,12 @@ function parse_tuic(outbounds_n) {
   let sni = findFieldValue(outbounds_n, "sni") || "";
   let alpnValue = findFieldValue(outbounds_n, "alpn");
   var alpn;
-  if (alpnValue.length === 1) {
+  if (Array.isArray(alpnValue) && alpnValue.length === 1) {
     alpn = alpnValue[0].toString();
-  } else {
+  } else if (Array.isArray(alpnValue) && alpnValue.length > 1) {
     alpn = alpnValue.join(",");
+  } else {
+    alpn = "";
   }
   let tuicDict = {
     congestion_control: congestion_controller,
@@ -3005,7 +3009,7 @@ async function fetchWebPageContent(url) {
     return stripHtmlTags(content);
   } catch (error) {
     console.error(`\u83B7\u53D6${url} \u7F51\u9875\u5185\u5BB9\u5931\u8D25: ${error.message}`);
-    return {};
+    return "";
   }
 }
 function stripHtmlTags(str2) {
@@ -3049,9 +3053,14 @@ async function fetchAndProcessUrl(url) {
       const uniqueArray = Array.from(uniqueSet);
       return uniqueArray;
     } else {
-      let yamlObject = js_yaml_default.load(content);
-      if (yamlObject && typeof yamlObject === "object") {
-        outbounds = findFieldValue(yamlObject, "proxies");
+      try {
+        let yamlObject = js_yaml_default.load(content);
+        if (yamlObject && typeof yamlObject === "object") {
+          outbounds = findFieldValue(yamlObject, "proxies");
+        }
+      } catch (yamlError) {
+        // \u89E3\u6790yaml\u5931\u8D25(\u4F8B\u5982\u6E90\u6570\u636E\u662F\u635F\u574F\u7684json/yaml)\uFF0C\u8DF3\u8FC7\u8BE5\u94FE\u63A5\uFF0C\u4E0D\u5F71\u54CD\u5176\u5B83\u94FE\u63A5
+        console.error(`\u89E3\u6790${url} \u7684yaml\u5185\u5BB9\u5931\u8D25: ${yamlError.message}`);
       }
     }
   }
@@ -3218,16 +3227,16 @@ function v2rayLinksHandle(str2) {
   }
 }
 var targetUrls = [
-  // ChromeGo/EdgeGo的订阅链接(已剔除内容重复的订阅链接)
-  "https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/naiveproxy/2/config.json",
-  "https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/hysteria2/2/config.json",
+  // ChromeGo/EdgeGo的订阅链接(已剔除内容重复的订阅链接，fastly.jsdelivr.net镜像已失效，改用gitlabip.xyz/gitlab.com镜像)
+  "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/naiveproxy/2/config.json",
+  "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria2/2/config.json",
   "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria2/3/config.json",
   "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/naiveproxy/1/config.json",
-  "https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/xray/2/config.json",
-  "https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/xray/4/config.json",
-  "https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ip/singbox/2/config.json",
-  "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/singbox/1/config.json",
-  "https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/hysteria/2/config.json",
+  "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/xray/2/config.json",
+  "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/xray/4/config.json",
+  "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ip/singbox/2/config.json",
+  "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/singbox/1/config.json",
+  "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria/2/config.json",
   "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria/3/config.json",
   "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria/1/config.json",
   "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/hysteria/3/config.json",
@@ -3235,16 +3244,14 @@ var targetUrls = [
   "https://gitlab.com/free9999/ipupdate/-/raw/master/hysteria/2/config.json",
   "https://gitlab.com/free9999/ipupdate/-/raw/master/hysteria2/2/config.json",
   "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/clash.meta2/5/config.yaml",
-  "https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/clash.meta2/4/config.yaml",
+  "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/clash.meta2/4/config.yaml",
   "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/clash.meta2/1/config.yaml",
   // 'https://fastly.jsdelivr.net/gh/jsvpn/jsproxy@dev/yule/20200325/1299699.md',
   "https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ip/clash.meta2/1/config.yaml",
-  "https://fastly.jsdelivr.net/gh/Alvin9999/pac2@latest/quick/config.yaml",
-  "https://fastly.jsdelivr.net/gh/Alvin9999/pac2@latest/quick/4/config.yaml",
+  "https://www.gitlabip.xyz/Alvin9999/pac2/master/quick/config.yaml",
+  "https://www.gitlabip.xyz/Alvin9999/pac2/master/quick/4/config.yaml",
   // 也可以添加其它来源且数据格式为json或yaml的订阅链接
-  "https://raw.githubusercontent.com/aiboboxx/clashfree/main/clash.yml",
   // 可以添加明文v2ray分享链接的订阅或base64订阅链接
-  "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2",
   "https://ghfast.top/https://raw.githubusercontent.com/free18/v2ray/refs/heads/main/v.txt"
 ];
 async function processUrls(targetUrls2) {
@@ -3266,15 +3273,20 @@ async function processUrls(targetUrls2) {
     return Promise.all(results2);
   };
   await asyncPool(maxConcurrency, targetUrls2, async (url) => {
-    const link = await fetchAndProcessUrl(url);
-    if (Array.isArray(link)) {
-      link.forEach((item) => {
-        if (!results.includes(item)) {
-          results.push(item);
-        }
-      });
-    } else if (link && !results.includes(link)) {
-      results.push(link);
+    try {
+      const link = await fetchAndProcessUrl(url);
+      if (Array.isArray(link)) {
+        link.forEach((item) => {
+          if (!results.includes(item)) {
+            results.push(item);
+          }
+        });
+      } else if (link && !results.includes(link)) {
+        results.push(link);
+      }
+    } catch (error) {
+      // \u5355\u4E2A\u94FE\u63A5\u5904\u7406\u5931\u8D25(\u89E3\u6790\u5D29\u6E83\u7B49)\u4E0D\u5F71\u54CD\u5176\u5B83\u94FE\u63A5\uFF0C\u4FDD\u8BC1\u6574\u4E2Aworker\u6B63\u5E38\u8FD4\u56DE
+      console.error(`\u5904\u7406${url} \u5931\u8D25: ${error.message}`);
     }
   });
   return results;

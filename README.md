@@ -34,10 +34,10 @@
 
 #### 3、出现 Error: Too many subrequests 错误
 
-原因是 `_worker.js` 中第 3220 行 `targetUrls` 的链接太多了，尽可能减少链接的数量（cloudflare免费用户：控制50条以内），重点剔除内容相同的链接。
+原因是 `_worker.js` 中 `targetUrls`（在文件中搜索 `const targetUrls` 即可找到）的链接太多了，尽可能减少链接的数量（cloudflare免费用户：控制50条以内），重点剔除内容相同的链接。
 
 #### 4、获取到的节点太少
 
 在剔除重复节点的情况下，获取到的节点数 **少于** 配置文件中的**实际节点数**，原因：
 - 1、出现没有检查到的代码 bug ，导致配置文件转换为分享的链接失败，亦或者不支持这个节点转换为分享链接。
-- 2、 因为`_worker.js` 第 3220 行 `targetUrls` 的链接太多了，出现 `Error: Too many subrequests` 错误，只处理到没有报 `Error: Too many subrequests` 错误之前的代理节点，导致获取到节点太少。
+- 2、 因为`_worker.js` 中 `targetUrls` 的链接太多了，出现 `Error: Too many subrequests` 错误，只处理到没有报 `Error: Too many subrequests` 错误之前的代理节点，导致获取到节点太少。

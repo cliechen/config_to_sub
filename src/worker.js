@@ -28,8 +28,10 @@ function parse_hysteria(outbounds_n) {
 	let alpn;
 	if (typeof alpnValue === 'string') {
 		alpn = alpnValue;
-	} else {
+	} else if (Array.isArray(alpnValue) && alpnValue.length > 0) {
 		alpn = alpnValue.length === 1 ? alpnValue[0].toString() : alpnValue.join(',');
+	} else {
+		alpn = '';
 	}
 
 	let hysteriaDict = {
@@ -287,10 +289,10 @@ function parse_tr0jan(outbounds_n) {
 // ------------------------------------------ 解析和构建 tuic 节点 ------------------------------------------
 
 function parse_tuic(outbounds_n) {
-	let uuid = findFieldValue(outbounds_n, 'uuid');
-	let password = findFieldValue(outbounds_n, 'password');
+	let uuid = findFieldValue(outbounds_n, 'uuid') || '';
+	let password = findFieldValue(outbounds_n, 'password') || '';
 	let server = findFieldValue(outbounds_n, 'server') || '';
-	if (server === '127.0.0.1' || server === '') {
+	if (server === '127.0.0.1' || server === '' || uuid === '' || password === '') {
 		return '';
 	}
 	let port = findFieldValue(outbounds_n, 'port');
@@ -299,12 +301,14 @@ function parse_tuic(outbounds_n) {
 	let sni = findFieldValue(outbounds_n, 'sni') || '';
 	let alpnValue = findFieldValue(outbounds_n, 'alpn');
 	var alpn;
-	if (alpnValue.length === 1) {
+	if (Array.isArray(alpnValue) && alpnValue.length === 1) {
 		// 如果数组只有一个元素，直接获取该元素
 		alpn = alpnValue[0].toString();
-	} else {
+	} else if (Array.isArray(alpnValue) && alpnValue.length > 1) {
 		// 如果数组有多个元素，使用逗号连接
 		alpn = alpnValue.join(',');
+	} else {
+		alpn = '';
 	}
 	let tuicDict = {
 		congestion_control: congestion_controller,
@@ -398,7 +402,7 @@ async function fetchWebPageContent(url) {
 		return stripHtmlTags(content);
 	} catch (error) {
 		console.error(`获取${url} 网页内容失败: ${error.message}`);
-		return {};
+		return '';
 	}
 }
 
@@ -456,9 +460,14 @@ async function fetchAndProcessUrl(url) {
 			const uniqueArray = Array.from(uniqueSet);
 			return uniqueArray;
 		} else {
-			let yamlObject = yaml.load(content); // 使用js-yaml库解析yaml
-			if (yamlObject && typeof yamlObject === 'object') {
-				outbounds = findFieldValue(yamlObject, 'proxies');
+			try {
+				let yamlObject = yaml.load(content); // 使用js-yaml库解析yaml
+				if (yamlObject && typeof yamlObject === 'object') {
+					outbounds = findFieldValue(yamlObject, 'proxies');
+				}
+			} catch (yamlError) {
+				// 解析yaml失败(例如源数据是损坏的json/yaml)，跳过该链接，不影响其它链接
+				console.error(`解析${url} 的yaml内容失败: ${yamlError.message}`);
 			}
 		}
 	}
@@ -701,16 +710,16 @@ function v2rayLinksHandle(str) {
  * 使用这个工具可以对订阅链接的内容比较，找出内容互不相同的链接，内容相同就选择其中的一个链接
  */
 const targetUrls = [
-	// ChromeGo/EdgeGo的订阅链接(已剔除内容重复的订阅链接)
-	'https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/naiveproxy/2/config.json',
-	'https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/hysteria2/2/config.json',
+	// ChromeGo/EdgeGo的订阅链接(已剔除内容重复的订阅链接，fastly.jsdelivr.net镜像已失效，改用gitlabip.xyz/gitlab.com镜像)
+	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/naiveproxy/2/config.json',
+	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria2/2/config.json',
 	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria2/3/config.json',
 	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/naiveproxy/1/config.json',
-	'https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/xray/2/config.json',
-	'https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/xray/4/config.json',
-	'https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ip/singbox/2/config.json',
-	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/singbox/1/config.json',
-	'https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/hysteria/2/config.json',
+	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/xray/2/config.json',
+	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/xray/4/config.json',
+	'https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ip/singbox/2/config.json',
+	'https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/singbox/1/config.json',
+	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria/2/config.json',
 	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria/3/config.json',
 	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/hysteria/1/config.json',
 	'https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/hysteria/3/config.json',
@@ -718,16 +727,14 @@ const targetUrls = [
 	'https://gitlab.com/free9999/ipupdate/-/raw/master/hysteria/2/config.json',
 	'https://gitlab.com/free9999/ipupdate/-/raw/master/hysteria2/2/config.json',
 	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/clash.meta2/5/config.yaml',
-	'https://fastly.jsdelivr.net/gh/Alvin9999/PAC@latest/backup/img/1/2/ipp/clash.meta2/4/config.yaml',
+	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/clash.meta2/4/config.yaml',
 	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/clash.meta2/1/config.yaml',
 	// 'https://fastly.jsdelivr.net/gh/jsvpn/jsproxy@dev/yule/20200325/1299699.md',
 	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ip/clash.meta2/1/config.yaml',
-	'https://fastly.jsdelivr.net/gh/Alvin9999/pac2@latest/quick/config.yaml',
-	'https://fastly.jsdelivr.net/gh/Alvin9999/pac2@latest/quick/4/config.yaml',
+	'https://www.gitlabip.xyz/Alvin9999/pac2/master/quick/config.yaml',
+	'https://www.gitlabip.xyz/Alvin9999/pac2/master/quick/4/config.yaml',
 	// 也可以添加其它来源且数据格式为json或yaml的订阅链接
-	'https://raw.githubusercontent.com/aiboboxx/clashfree/main/clash.yml',
 	// 可以添加明文v2ray分享链接的订阅或base64订阅链接
-	'https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2',
 	'https://ghfast.top/https://raw.githubusercontent.com/free18/v2ray/refs/heads/main/v.txt',
 ];
 
@@ -757,17 +764,22 @@ async function processUrls(targetUrls) {
 
 	// 使用asyncPool并发执行异步任务
 	await asyncPool(maxConcurrency, targetUrls, async (url) => {
-		const link = await fetchAndProcessUrl(url);
-		if (Array.isArray(link)) {
-			// 剔除重复的link节点链接
-			link.forEach((item) => {
-				if (!results.includes(item)) {
-					results.push(item);
-				}
-			});
-		} else if (link && !results.includes(link)) {
-			// 直接将link节点链接放入results数组中
-			results.push(link);
+		try {
+			const link = await fetchAndProcessUrl(url);
+			if (Array.isArray(link)) {
+				// 剔除重复的link节点链接
+				link.forEach((item) => {
+					if (!results.includes(item)) {
+						results.push(item);
+					}
+				});
+			} else if (link && !results.includes(link)) {
+				// 直接将link节点链接放入results数组中
+				results.push(link);
+			}
+		} catch (error) {
+			// 单个链接处理失败(解析崩溃等)不影响其它链接，保证整个worker正常返回
+			console.error(`处理${url} 失败: ${error.message}`);
 		}
 	});
 
