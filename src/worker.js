@@ -1,4 +1,414 @@
-import yaml from 'js-yaml'; // npm install js-yaml
+// ====================================================================================
+// 极简 YAML 解析/序列化(零第三方依赖)
+// 只实现订阅/代理配置文件用到的 YAML 子集:
+//   块状映射/序列、嵌套缩进、同缩进序列、单双引号、注释、锚点/别名、基础流式集合
+// 不做完整 YAML 规范支持;遇到不认识的语法时宽容降级,保证不崩溃
+// ====================================================================================
+
+// 去掉行尾注释(# 前面必须是空白或行首,引号内的 # 不算注释)
+function stripYamlComment(line) {
+	let inS = false;
+	let inD = false;
+	for (let i = 0; i < line.length; i++) {
+		const c = line[i];
+		if (inS) {
+			if (c === "'") inS = false;
+			continue;
+		}
+		if (inD) {
+			if (c === '"') inD = false;
+			continue;
+		}
+		if (c === "'") inS = true;
+		else if (c === '"') inD = true;
+		else if (c === '#' && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+	}
+	return line;
+}
+
+// 预处理: 拆行、去注释、去行尾空白、去掉空行
+function preprocessYamlLines(text) {
+	const lines = [];
+	for (const raw of String(text).split(/\r?\n/)) {
+		const stripped = stripYamlComment(raw).replace(/[ \t]+$/, '');
+		if (stripped.trim() !== '') {
+			lines.push(stripped);
+		}
+	}
+	return lines;
+}
+
+// 拆 "key: value" 或 "key:"(引号感知,值里的 ": " 不会误伤)
+function yamlSplitKeyValue(str) {
+	let inS = false;
+	let inD = false;
+	for (let i = 0; i < str.length; i++) {
+		const c = str[i];
+		if (inS) {
+			if (c === "'") inS = false;
+			continue;
+		}
+		if (inD) {
+			if (c === '"') inD = false;
+			continue;
+		}
+		if (c === "'") {
+			inS = true;
+			continue;
+		}
+		if (c === '"') {
+			inD = true;
+			continue;
+		}
+		if (c === ':' && (i + 1 >= str.length || str[i + 1] === ' ' || str[i + 1] === '\t')) {
+			const key = str.slice(0, i).trim();
+			const rest = str.slice(i + 1).trim();
+			if (key !== '') return { key: key, value: rest, hasValue: rest !== '' };
+		}
+	}
+	return null;
+}
+
+// 拆 "&锚点名 值" 或 "&锚点名"
+function yamlSplitAnchor(raw) {
+	if (!raw.startsWith('&')) return null;
+	const sp = raw.indexOf(' ');
+	if (sp < 0) return { name: raw.slice(1), rest: '' };
+	return { name: raw.slice(1, sp), rest: raw.slice(sp + 1) };
+}
+
+// 解析标量(含引号/布尔/数字/空/null/锚点/别名/基础流式集合)
+function yamlParseScalar(raw, ctx) {
+	if (raw === '') return null;
+	if (raw[0] === "'") {
+		if (raw.endsWith("'") && raw.length >= 2) return raw.slice(1, -1).replace(/''/g, "'");
+		return raw.slice(1);
+	}
+	if (raw[0] === '"') {
+		if (raw.endsWith('"') && raw.length >= 2) {
+			return raw
+				.slice(1, -1)
+				.replace(/\\n/g, '\n')
+				.replace(/\\t/g, '\t')
+				.replace(/\\"/g, '"')
+				.replace(/\\\\/g, '\\');
+		}
+		return raw.slice(1);
+	}
+	// 锚点定义(&name value)
+	if (raw.startsWith('&')) {
+		const anchor = yamlSplitAnchor(raw);
+		if (anchor && anchor.rest !== '') {
+			const val = yamlParseScalar(anchor.rest, ctx);
+			if (anchor.name && ctx) ctx.anchors[anchor.name] = val;
+			return val;
+		}
+		return null;
+	}
+	// 别名引用(*name)
+	if (raw.startsWith('*')) {
+		if (ctx && ctx.anchors && ctx.anchors[raw.slice(1)] !== undefined) {
+			return ctx.anchors[raw.slice(1)];
+		}
+		return raw;
+	}
+	const lower = raw.toLowerCase();
+	if (lower === 'true' || lower === 'yes' || lower === 'on') return true;
+	if (lower === 'false' || lower === 'no' || lower === 'off') return false;
+	if (lower === 'null' || lower === '~') return null;
+	if (/^-?\d+$/.test(raw)) return parseInt(raw, 10);
+	if (/^-?\d+\.\d+$/.test(raw)) return parseFloat(raw);
+	// 基础流式集合
+	if (raw.startsWith('[') && raw.endsWith(']')) {
+		const inner = raw.slice(1, -1).trim();
+		if (inner === '') return [];
+		return inner.split(',').map((s) => yamlParseScalar(s.trim(), ctx));
+	}
+	if (raw.startsWith('{') && raw.endsWith('}')) {
+		const inner = raw.slice(1, -1).trim();
+		const obj = {};
+		if (inner !== '') {
+			for (const part of inner.split(',')) {
+				const kv = yamlSplitKeyValue(part.trim());
+				if (kv) obj[kv.key] = kv.hasValue ? yamlParseScalar(kv.value, ctx) : null;
+			}
+		}
+		return obj;
+	}
+	return raw;
+}
+
+// 解析一个键的值(行内值 / 锚点 + 后续块 / 后续深缩进块 / 同缩进序列)
+// 返回 { value, nextIndex }
+function yamlResolveValue(lines, idx, ctx, keyIndent, inlineValue) {
+	if (inlineValue !== null && inlineValue !== undefined && inlineValue !== '') {
+		const v = inlineValue.trim();
+		const anchor = v.startsWith('&') ? yamlSplitAnchor(v) : null;
+		if (anchor && anchor.rest !== '') {
+			const val = yamlParseScalar(anchor.rest, ctx);
+			if (anchor.name && ctx) ctx.anchors[anchor.name] = val;
+			return { value: val, nextIndex: idx };
+		}
+		if (anchor) {
+			// 只有锚点名,值在后续块
+			const next = lines[idx];
+			if (next === undefined) {
+				if (anchor.name && ctx) ctx.anchors[anchor.name] = null;
+				return { value: null, nextIndex: idx };
+			}
+			const nind = next.length - next.trimStart().length;
+			if (nind > keyIndent) {
+				const [child, ni] = yamlParseBlock(lines, idx, ctx, nind);
+				if (anchor.name && ctx) ctx.anchors[anchor.name] = child;
+				return { value: child, nextIndex: ni };
+			}
+			if (nind === keyIndent && next.slice(keyIndent).trim().startsWith('-')) {
+				const [child, ni] = yamlParseSeq(lines, idx, ctx, keyIndent);
+				if (anchor.name && ctx) ctx.anchors[anchor.name] = child;
+				return { value: child, nextIndex: ni };
+			}
+			if (anchor.name && ctx) ctx.anchors[anchor.name] = null;
+			return { value: null, nextIndex: idx };
+		}
+		return { value: yamlParseScalar(v, ctx), nextIndex: idx };
+	}
+	// 值在后续行
+	const next = lines[idx];
+	if (next === undefined) return { value: null, nextIndex: idx };
+	const nind = next.length - next.trimStart().length;
+	if (nind > keyIndent) {
+		const [child, ni] = yamlParseBlock(lines, idx, ctx, nind);
+		return { value: child, nextIndex: ni };
+	}
+	if (nind === keyIndent && next.slice(keyIndent).trim().startsWith('-')) {
+		const [child, ni] = yamlParseSeq(lines, idx, ctx, keyIndent);
+		return { value: child, nextIndex: ni };
+	}
+	return { value: null, nextIndex: idx };
+}
+
+// 继续解析映射条目到 obj 中(从 start 开始,要求缩进 > minIndent)
+function yamlParseMapTail(lines, start, ctx, minIndent, obj) {
+	let j = start;
+	while (j < lines.length) {
+		const l = lines[j];
+		const ind = l.length - l.trimStart().length;
+		if (ind <= minIndent) break;
+		const t = l.slice(ind).trim();
+		if (t === '' || t.startsWith('-')) {
+			j++;
+			continue;
+		}
+		const e = yamlSplitKeyValue(t);
+		if (!e) {
+			j++;
+			continue;
+		}
+		const r = yamlResolveValue(lines, j + 1, ctx, ind, e.hasValue ? e.value : null);
+		obj[e.key] = r.value;
+		j = r.nextIndex;
+	}
+	return j;
+}
+
+// 解析块(映射或序列),lines[idx] 的缩进必须等于 indent
+function yamlParseBlock(lines, idx, ctx, indent) {
+	const trimmed = lines[idx].slice(indent).trim();
+	if (trimmed.startsWith('-')) {
+		return yamlParseSeq(lines, idx, ctx, indent);
+	}
+	const kv = yamlSplitKeyValue(trimmed);
+	if (kv === null) {
+		// 纯标量文档
+		return [yamlParseScalar(trimmed, ctx), idx + 1];
+	}
+	const obj = {};
+	let i = idx;
+	while (i < lines.length) {
+		const l = lines[i];
+		const ind = l.length - l.trimStart().length;
+		if (ind < indent || ind > indent) break;
+		const t = l.slice(ind).trim();
+		if (t === '') {
+			i++;
+			continue;
+		}
+		if (t.startsWith('-')) break; // 同缩进序列属于父级
+		const e = yamlSplitKeyValue(t);
+		if (!e) {
+			i++;
+			continue;
+		}
+		const r = yamlResolveValue(lines, i + 1, ctx, ind, e.hasValue ? e.value : null);
+		obj[e.key] = r.value;
+		i = r.nextIndex;
+	}
+	return [obj, i];
+}
+
+// 解析序列(块状),lines[idx] 的缩进必须等于 indent
+function yamlParseSeq(lines, idx, ctx, indent) {
+	const arr = [];
+	let i = idx;
+	while (i < lines.length) {
+		const l = lines[i];
+		const ind = l.length - l.trimStart().length;
+		if (ind !== indent) break;
+		const t = l.slice(ind).trim();
+		if (!t.startsWith('-')) break;
+		const itemText = t.slice(1).trim();
+		if (itemText === '') {
+			// 空项: 内容在下一行(更深缩进)
+			const next = lines[i + 1];
+			if (next === undefined) {
+				arr.push(null);
+				i++;
+				continue;
+			}
+			const nind = next.length - next.trimStart().length;
+			if (nind > indent) {
+				const [child, ni] = yamlParseBlock(lines, i + 1, ctx, nind);
+				arr.push(child);
+				i = ni;
+			} else {
+				arr.push(null);
+				i++;
+			}
+			continue;
+		}
+		const kv = yamlSplitKeyValue(itemText);
+		if (kv) {
+			// 映射项: "- key: value",其余子键在更深行
+			const obj = {};
+			// 首键的 keyIndent 按子键所在缩进(indent + 2)计算
+			const r = yamlResolveValue(lines, i + 1, ctx, indent + 2, kv.hasValue ? kv.value : null);
+			obj[kv.key] = r.value;
+			const j = yamlParseMapTail(lines, r.nextIndex, ctx, indent, obj);
+			arr.push(obj);
+			i = j;
+			continue;
+		}
+		// 标量项
+		arr.push(yamlParseScalar(itemText, ctx));
+		i++;
+	}
+	return [arr, i];
+}
+
+// 解析单个 YAML 文档(容忍解析失败,返回 null)
+function yamlParseSingle(text) {
+	const lines = preprocessYamlLines(text);
+	if (lines.length === 0) return null;
+	const indent = lines[0].length - lines[0].trimStart().length;
+	const [node] = yamlParseBlock(lines, 0, { anchors: {} }, indent);
+	return node;
+}
+
+// 解析整个内容: 先按 --- 文档分隔符拆分,再按顶层key重复边界拆分(聚合配置),
+// 返回所有解析成功的文档对象数组
+function yamlParseAll(text) {
+	const docs = [];
+	const raw = String(text);
+	// 1) 按 --- / ... 文档分隔符拆分
+	const docParts = raw.split(/^---\s*$|^\.\.\.\s*$/m);
+	for (const part of docParts) {
+		if (!part.trim()) continue;
+		// 2) 聚合配置: 顶层key重复即拆分(复用 splitClashDuplicated)
+		for (const chunk of splitClashDuplicated(part)) {
+			try {
+				const node = yamlParseSingle(chunk);
+				if (node !== null && node !== undefined) docs.push(node);
+			} catch (e) {
+				// 单个块解析失败忽略
+			}
+		}
+	}
+	return docs;
+}
+
+// 解析单个文档(返回第一个非空结果)
+function yamlParse(text) {
+	const docs = yamlParseAll(text);
+	return docs.length > 0 ? docs[0] : null;
+}
+
+// ============================= YAML 序列化(生成 clash 配置) =============================
+
+// 判断标量是否需要加单引号(保守策略: 拿不准就加,单引号永远合法)
+function yamlQuoteScalar(s) {
+	s = String(s);
+	if (s === '') return "''";
+	const lower = s.toLowerCase();
+	const looksNumber = /^-?\d+(\.\d+)?$/.test(s);
+	const reserved = ['true', 'false', 'yes', 'no', 'on', 'off', 'null', '~'];
+	const needsQuote =
+		looksNumber ||
+		reserved.includes(lower) ||
+		/^[\s\-?:,\[\]{}#&*!|>'"%@`\\]/.test(s) || // 起始字符特殊
+		/[\s"'#,:\[\]{}&*!|>%@`\\]/.test(s); // 含空白或特殊字符
+	if (!needsQuote) return s;
+	return `'${s.replace(/'/g, "''")}'`;
+}
+
+// 键一般来自固定字段名;含特殊字符时加引号
+function yamlQuoteKey(k) {
+	k = String(k);
+	if (/^[A-Za-z0-9_-]+$/.test(k)) return k;
+	return `'${k.replace(/'/g, "''")}'`;
+}
+
+function yamlDumpValue(v) {
+	if (v === null || v === undefined) return 'null';
+	if (typeof v === 'number') return String(v);
+	if (typeof v === 'boolean') return v ? 'true' : 'false';
+	if (Array.isArray(v)) return '[' + v.map(yamlDumpValue).join(', ') + ']';
+	return yamlQuoteScalar(v);
+}
+
+function yamlDumpEntry(lines, indent, key, value) {
+	const pad = ' '.repeat(indent);
+	if (value === null || value === undefined) {
+		lines.push(`${pad}${yamlQuoteKey(key)}:`);
+	} else if (Array.isArray(value)) {
+		if (value.length === 0) {
+			lines.push(`${pad}${yamlQuoteKey(key)}: []`);
+		} else {
+			lines.push(`${pad}${yamlQuoteKey(key)}:`);
+			for (const item of value) {
+				if (item && typeof item === 'object') {
+					const entries = Object.entries(item);
+					if (entries.length === 0) {
+						lines.push(`${pad}  - {}`);
+						continue;
+					}
+					// 第一项行内输出,其余子键继续缩进
+					const [k0, v0] = entries[0];
+					lines.push(`${pad}  - ${yamlQuoteKey(k0)}: ${yamlDumpValue(v0)}`);
+					for (let i = 1; i < entries.length; i++) {
+						yamlDumpEntry(lines, indent + 4, entries[i][0], entries[i][1]);
+					}
+				} else {
+					lines.push(`${pad}  - ${yamlDumpValue(item)}`);
+				}
+			}
+		}
+	} else if (value && typeof value === 'object') {
+		lines.push(`${pad}${yamlQuoteKey(key)}:`);
+		for (const [k, v] of Object.entries(value)) {
+			yamlDumpEntry(lines, indent + 2, k, v);
+		}
+	} else {
+		lines.push(`${pad}${yamlQuoteKey(key)}: ${yamlDumpValue(value)}`);
+	}
+}
+
+function yamlDump(obj) {
+	const lines = [];
+	for (const [key, value] of Object.entries(obj || {})) {
+		yamlDumpEntry(lines, 0, key, value);
+	}
+	return lines.join('\n') + (lines.length > 0 ? '\n' : '');
+}
 
 // ----------------------------------------- 解析和构建 hysteria 节点 ---------------------------------------
 
@@ -7,7 +417,14 @@ function parse_hysteria(outbounds_n) {
 	if (server.startsWith('127.0.0.1') || server === '') {
 		return '';
 	}
-	let port = findFieldValue(outbounds_n, 'server_port') || findFieldValue(outbounds_n, 'port');
+	let port = findFieldValue(outbounds_n, 'server_port') || findFieldValue(outbounds_n, 'port') || 443;
+	// 只有当server未携带端口号时才拼接端口(兼容 "host:port" / "[ipv6]:port" 已带端口的情况)
+	if (!hostAlreadyHasPort(server)) {
+		if (server.includes(':') && !server.startsWith('[')) {
+			server = `[${server}]`; // 裸IPv6地址需要加中括号
+		}
+		server = `${server}:${port}`;
+	}
 
 	let upmbps_str = findFieldValue(outbounds_n, 'up_mbps') || findFieldValue(outbounds_n, 'up');
 	let downmbps_str = findFieldValue(outbounds_n, 'down_mbps') || findFieldValue(outbounds_n, 'down');
@@ -51,7 +468,15 @@ function parse_hysteria(outbounds_n) {
 	// 进行 URL 参数编码
 	const encodedParams = new URLSearchParams(filteredParams).toString();
 
-	return `hysteria://${server}:${port}?${encodedParams}#[hysteria]_${server}:${port}`;
+	return `hysteria://${server}?${encodedParams}#[hysteria]_${server}`;
+}
+
+// 判断server是否已经带有端口号("host:port" 或 "[ipv6]:port")
+function hostAlreadyHasPort(server) {
+	if (/^\[.*\]:\d+$/.test(server)) return true; // 已加中括号的IPv6且带端口
+	const idx = server.lastIndexOf(':');
+	// 恰好一个冒号且冒号后面是数字才认为是"host:port";多个冒号是裸IPv6,不算已带端口
+	return idx >= 0 && server.indexOf(':') === idx && /^\d+$/.test(server.slice(idx + 1));
 }
 
 // ------------------------------------------ 解析和构建 hy2 节点 -------------------------------------------
@@ -61,21 +486,28 @@ function parse_hy2(outbounds_n) {
 	if (server.startsWith('127.0.0.1') || server === '') {
 		return '';
 	}
-	let port = findFieldValue(outbounds_n, 'port');
-
-	// 排除"domain:port"、"ipv4:port" 或 "ipv6:port" 这三种情况地址的正则表达式
-	let genericAddressRegex = /^(?!.*:\d+$)(?!\[.*\].*:\d+$)/;
-	if (genericAddressRegex.test(server)) {
+	let port = findFieldValue(outbounds_n, 'server_port') || findFieldValue(outbounds_n, 'port') || 443;
+	// 只有当server未携带端口号时才拼接端口。
+	// "host:port" / "[ipv6]:port" 视为已带端口;裸IPv6地址(未加中括号)则补上中括号再拼端口
+	if (!hostAlreadyHasPort(server)) {
+		if (server.includes(':') && !server.startsWith('[')) {
+			server = `[${server}]`; // 裸IPv6地址需要加中括号
+		}
 		server = `${server}:${port}`;
 	}
 
 	let password = findFieldValue(outbounds_n, 'password') || findFieldValue(outbounds_n, 'auth');
 	let obfs = findFieldValue(outbounds_n, 'obfs') || '';
 	let obfs_password = findFieldValue(outbounds_n, 'obfs-password') || '';
-	let sni = findFieldValue(outbounds_n, 'sni') || '';
+	// sing-box 的 obfs 是对象 {type, password}
+	if (obfs && typeof obfs === 'object') {
+		obfs_password = obfs.password || '';
+		obfs = obfs.type || '';
+	}
+	let sni = findFieldValue(outbounds_n, 'sni') || findFieldValue(outbounds_n, 'server_name') || '';
 
-	let up = findFieldValue(outbounds_n, 'up') || '80';
-	let down = findFieldValue(outbounds_n, 'down') || '100';
+	let up = findFieldValue(outbounds_n, 'up') || findFieldValue(outbounds_n, 'up_mbps') || '80';
+	let down = findFieldValue(outbounds_n, 'down') || findFieldValue(outbounds_n, 'down_mbps') || '100';
 	// 提取字符串中的数字，然后转换为数字类型
 	let upmbps = parseInt(String(up).replace(/\D/g, ''), 10) || 0;
 	let downmbps = parseInt(String(down).replace(/\D/g, ''), 10) || 0;
@@ -99,47 +531,71 @@ function parse_hy2(outbounds_n) {
 	// 进行 URL 参数编码
 	const encodedParams = new URLSearchParams(filteredParams).toString();
 
-	return `hy2://${password}@${server}?${encodedParams}#[hy2]_${server}`;
+	// userinfo 做百分号编码,避免密码含 @ ? # : 等特殊字符时链接被解析错
+	return `hy2://${encodeURIComponent(password || '')}@${server}?${encodedParams}#[hy2]_${server}`;
 }
 
 // ----------------------------------------- 解析和构建 vless 节点 ------------------------------------------
+
+// 从配置中提取TLS状态。xray/clash 的 security/tls 是字符串或布尔值,
+// sing-box 的 tls 是对象({enabled, reality, server_name, utls...})
+// 返回 'reality' / 'tls' / ''
+function resolveTlsSecurity(outbounds_n, publicKey) {
+	if (publicKey) return 'reality';
+	const raw = findFieldValue(outbounds_n.streamSettings, 'security') || findFieldValue(outbounds_n, 'tls') || '';
+	if (raw && typeof raw === 'object') {
+		// sing-box 风格
+		if (raw.reality && raw.reality.enabled) return 'reality';
+		return raw.enabled ? 'tls' : '';
+	}
+	if (raw === 'none' || raw === '' || raw === false) return '';
+	if (raw === true || raw === 'tls') return 'tls';
+	return '';
+}
 
 function parse_vle55(outbounds_n) {
 	let address = findFieldValue(outbounds_n, 'address') || findFieldValue(outbounds_n, 'server') || '';
 	if (address === '127.0.0.1' || address === '') {
 		return '';
 	}
-	let port = findFieldValue(outbounds_n, 'port');
+	// sing-box 的端口字段是 server_port
+	let port = findFieldValue(outbounds_n, 'port') || findFieldValue(outbounds_n, 'server_port');
 	let uuid = findFieldValue(outbounds_n, 'id') || findFieldValue(outbounds_n, 'uuid');
 	let encryption = findFieldValue(outbounds_n, 'encryption') || 'none'; // 加密方式
 	let flow = findFieldValue(outbounds_n, 'flow') || '';
-	let network = findFieldValue(outbounds_n, 'network');
+	// 传输协议(network):xray/clash 用 network 字段,sing-box 用 transport.type
+	let network = findFieldValue(outbounds_n.transport, 'type') || findFieldValue(outbounds_n, 'network');
+	if (typeof network !== 'string') network = '';
 	let host = findFieldValue(outbounds_n, 'Host') || findFieldValue(outbounds_n, 'host') || '';
-	let path = findFieldValue(outbounds_n, 'path') || '';
+	let path =
+		findFieldValue(outbounds_n, 'path') ||
+		findFieldValue(outbounds_n, 'serviceName') ||
+		findFieldValue(outbounds_n, 'service_name') ||
+		'';
 	// 目前发现publicKey和shortId是reality独有
-	let public_key = findFieldValue(outbounds_n, 'public-key') || findFieldValue(outbounds_n, 'publicKey') || '';
-	let short_id = findFieldValue(outbounds_n, 'short-id') || findFieldValue(outbounds_n, 'shortId') || '';
+	let public_key =
+		findFieldValue(outbounds_n, 'public-key') ||
+		findFieldValue(outbounds_n, 'publicKey') ||
+		findFieldValue(outbounds_n, 'public_key') ||
+		'';
+	let short_id =
+		findFieldValue(outbounds_n, 'short-id') ||
+		findFieldValue(outbounds_n, 'shortId') ||
+		findFieldValue(outbounds_n, 'short_id') ||
+		'';
 	// sni
-	let serverName = findFieldValue(outbounds_n, 'serverName') || findFieldValue(outbounds_n, 'servername') || '';
+	let serverName =
+		findFieldValue(outbounds_n, 'serverName') ||
+		findFieldValue(outbounds_n, 'servername') ||
+		findFieldValue(outbounds_n, 'server_name') ||
+		'';
 	if (host === '' && serverName === '') {
 		host = address;
 	} else if (host === '' && serverName !== '') {
 		host = serverName;
 	}
 	// 传输层安全(TLS)
-	let tls_security;
-	if (public_key !== '') {
-		tls_security = 'reality';
-	} else {
-		let tls = findFieldValue(outbounds_n.streamSettings, 'security') || findFieldValue(outbounds_n, 'tls') || '';
-		if (tls === 'none') {
-			tls_security = '';
-		} else if (tls === true) {
-			tls_security = 'tls';
-		} else {
-			tls_security = '';
-		}
-	}
+	let tls_security = resolveTlsSecurity(outbounds_n, public_key);
 	if (tls_security === '' && network === 'ws' && serverName !== '') {
 		tls_security = 'tls';
 	}
@@ -165,7 +621,7 @@ function parse_vle55(outbounds_n) {
 	// 进行 URL 参数编码
 	const encodedParams = new URLSearchParams(filteredParams).toString();
 
-	return `${base64Decode('dmxlc3M6Ly8')}${uuid}@${address}:${port}?${encodedParams}#[${base64Decode('dmxlc3M')}]_${address}:${port}`;
+	return `${base64Decode('dmxlc3M6Ly8')}${encodeURIComponent(uuid || '')}@${address}:${port}?${encodedParams}#[${base64Decode('dmxlc3M')}]_${address}:${port}`;
 }
 
 // ----------------------------------------- 解析和构建 vmess 节点 ------------------------------------------
@@ -175,30 +631,37 @@ function parse_vme55(outbounds_n) {
 	if (address === '127.0.0.1' || address === '') {
 		return '';
 	}
-	let port = findFieldValue(outbounds_n, 'port');
+	// sing-box 的端口字段是 server_port
+	let port = findFieldValue(outbounds_n, 'port') || findFieldValue(outbounds_n, 'server_port');
 	let uuid = findFieldValue(outbounds_n, 'id') || findFieldValue(outbounds_n, 'uuid');
-	let alterId = findFieldValue(outbounds_n, 'alterId') || 0;
+	let alterId = findFieldValue(outbounds_n, 'alterId') || findFieldValue(outbounds_n, 'alter_id') || 0;
 
 	// 加密方式(security)
 	let auto_security = findFieldValue(outbounds_n, 'cipher') || findFieldValue(outbounds_n.settings, 'security') || 'auto';
 
-	// 传输协议(network)
-	let network = findFieldValue(outbounds_n, 'network');
+	// 传输协议(network):xray/clash 用 network 字段,sing-box 用 transport.type
+	let network = findFieldValue(outbounds_n.transport, 'type') || findFieldValue(outbounds_n, 'network');
+	if (typeof network !== 'string') network = '';
 	// 伪装类型(type)
 	let type_encryption = findFieldValue(outbounds_n, 'encryption') || 'none';
 
 	// 传输层安全(TLS)
-	let tls = findFieldValue(outbounds_n.streamSettings, 'security') || findFieldValue(outbounds_n, 'tls') || '';
-	let tls_security = tls === true ? 'tls' || '' : tls;
+	let tls_security = resolveTlsSecurity(outbounds_n, '');
 
 	let path =
 		findFieldValue(outbounds_n, 'path') ||
 		findFieldValue(outbounds_n, 'ws-path') ||
 		findFieldValue(outbounds_n, 'grpc-service-name') ||
+		findFieldValue(outbounds_n, 'serviceName') ||
+		findFieldValue(outbounds_n, 'service_name') ||
 		'/';
 	// 伪装域名(host)
 	let host = findFieldValue(outbounds_n, 'Host') || findFieldValue(outbounds_n, 'host') || '';
-	let serverName = findFieldValue(outbounds_n, 'sni') || findFieldValue(outbounds_n, 'serverName') || '';
+	let serverName =
+		findFieldValue(outbounds_n, 'sni') ||
+		findFieldValue(outbounds_n, 'serverName') ||
+		findFieldValue(outbounds_n, 'server_name') ||
+		'';
 	if (serverName === '' && host === '') {
 		host = address;
 	}
@@ -236,13 +699,26 @@ function parse_shadowsocks(outbounds_n) {
 		return '';
 	}
 
-	let port = findFieldValue(outbounds_n, 'port');
+	// sing-box 的端口字段是 server_port
+	let port = findFieldValue(outbounds_n, 'port') || findFieldValue(outbounds_n, 'server_port');
 	let method = findFieldValue(outbounds_n, 'method') || findFieldValue(outbounds_n, 'cipher');
 	let password = findFieldValue(outbounds_n, 'password');
+	// SIP002 插件参数(可选):clash 用 plugin/plugin-opts,xray 用 plugin/pluginOpts
+	let plugin = findFieldValue(outbounds_n, 'plugin') || '';
+	let plugin_opts =
+		findFieldValue(outbounds_n, 'plugin-opts') ||
+		findFieldValue(outbounds_n, 'plugin_opts') ||
+		findFieldValue(outbounds_n, 'pluginOpts') ||
+		'';
+	let pluginParam = '';
+	if (plugin) {
+		pluginParam = plugin_opts ? `${plugin};${plugin_opts}` : plugin;
+	}
 	let method_with_password = `${method}:${password}`;
 	let base64EncodedString = base64Encode(method_with_password);
+	const query = pluginParam ? `?plugin=${encodeURIComponent(pluginParam)}` : '';
 
-	return `${base64Decode('c3M6Ly8')}${base64EncodedString}@${address}:${port}#[ss]_${address}`;
+	return `${base64Decode('c3M6Ly8')}${base64EncodedString}@${address}:${port}${query}#[ss]_${address}`;
 }
 
 // ----------------------------------------- 解析和构建 trojan 节点 -----------------------------------------
@@ -252,15 +728,22 @@ function parse_tr0jan(outbounds_n) {
 	if (server.startsWith('127.0.0.1') || server === '') {
 		return '';
 	}
-	let port = findFieldValue(outbounds_n, 'port');
+	// sing-box 的端口字段是 server_port
+	let port = findFieldValue(outbounds_n, 'port') || findFieldValue(outbounds_n, 'server_port');
 	let password = findFieldValue(outbounds_n, 'password');
-	let network = findFieldValue(outbounds_n, 'network') || 'tcp';
-	let path = findFieldValue(outbounds_n, 'path') || '';
+	// 传输协议(network):xray/clash 用 network 字段,sing-box 用 transport.type
+	let network = findFieldValue(outbounds_n.transport, 'type') || findFieldValue(outbounds_n, 'network') || 'tcp';
+	if (typeof network !== 'string') network = 'tcp';
+	let path =
+		findFieldValue(outbounds_n, 'path') ||
+		findFieldValue(outbounds_n, 'serviceName') ||
+		findFieldValue(outbounds_n, 'service_name') ||
+		'';
 	let host = findFieldValue(outbounds_n, 'Host') || findFieldValue(outbounds_n, 'host') || '';
-	let sni = findFieldValue(outbounds_n, 'sni') || '';
+	let sni = findFieldValue(outbounds_n, 'sni') || findFieldValue(outbounds_n, 'server_name') || '';
 	let fp = findFieldValue(outbounds_n, 'client-fingerprint') || findFieldValue(outbounds_n, 'fingerprint') || '';
 	let alpn = findFieldValue(outbounds_n, 'alpn') || ''; // 没有确定字段是否这个名字
-	let tls_security = '';
+	let tls_security = resolveTlsSecurity(outbounds_n, '');
 	if (sni) {
 		tls_security = 'tls';
 	}
@@ -283,7 +766,8 @@ function parse_tr0jan(outbounds_n) {
 	// 进行 URL 参数编码
 	const encodedParams = new URLSearchParams(filteredParams).toString();
 
-	return `${base64Decode('dHJvamFuOi8v')}${password}@${server}:${port}?${encodedParams}#[${base64Decode('dHJvamFu')}]_${server}`;
+	// userinfo 做百分号编码,避免密码含特殊字符时链接被解析错
+	return `${base64Decode('dHJvamFuOi8v')}${encodeURIComponent(password || '')}@${server}:${port}?${encodedParams}#[${base64Decode('dHJvamFu')}]_${server}`;
 }
 
 // ------------------------------------------ 解析和构建 tuic 节点 ------------------------------------------
@@ -295,10 +779,12 @@ function parse_tuic(outbounds_n) {
 	if (server === '127.0.0.1' || server === '' || uuid === '' || password === '') {
 		return '';
 	}
-	let port = findFieldValue(outbounds_n, 'port');
-	let congestion_controller = findFieldValue(outbounds_n, 'congestion-controller');
-	let udp_relay_mode = findFieldValue(outbounds_n, 'udp-relay-mode');
-	let sni = findFieldValue(outbounds_n, 'sni') || '';
+	// sing-box 的端口字段是 server_port
+	let port = findFieldValue(outbounds_n, 'port') || findFieldValue(outbounds_n, 'server_port');
+	let congestion_controller =
+		findFieldValue(outbounds_n, 'congestion-controller') || findFieldValue(outbounds_n, 'congestion_control');
+	let udp_relay_mode = findFieldValue(outbounds_n, 'udp-relay-mode') || findFieldValue(outbounds_n, 'udp_relay_mode');
+	let sni = findFieldValue(outbounds_n, 'sni') || findFieldValue(outbounds_n, 'server_name') || '';
 	let alpnValue = findFieldValue(outbounds_n, 'alpn');
 	var alpn;
 	if (Array.isArray(alpnValue) && alpnValue.length === 1) {
@@ -324,7 +810,8 @@ function parse_tuic(outbounds_n) {
 	// 进行 URL 参数编码
 	const encodedParams = new URLSearchParams(filteredParams).toString();
 
-	return `tuic://${uuid}:${password}@${server}:${port}?${encodedParams}#[tuic]_${server}`;
+	// userinfo 做百分号编码,避免 uuid/密码含特殊字符时链接被解析错
+	return `tuic://${encodeURIComponent(uuid)}:${encodeURIComponent(password)}@${server}:${port}?${encodedParams}#[tuic]_${server}`;
 }
 
 // ------------------------------------- 判断是否为mieru或juicity的代理 -------------------------------------
@@ -455,6 +942,16 @@ function splitClashDuplicated(content) {
 	return chunks;
 }
 
+// 判断分享链接是否为坏链接(源订阅自带占位符值: =undefined / :null / null@ / [object Object])
+function isBrokenLink(link) {
+	return (
+		link.includes('=undefined') ||
+		link.includes(':null') ||
+		link.includes('null@') ||
+		link.includes('[object')
+	);
+}
+
 // ---------------------------------- 去抓取网页、处理节点，返回节点的分享链接 ----------------------------------
 
 async function fetchAndProcessUrl(url) {
@@ -481,45 +978,28 @@ async function fetchAndProcessUrl(url) {
 				'bmFpdmUraHR0cHM6Ly8',
 			];
 			links.split('\n').forEach((link) => {
+				// 过滤源订阅自带的坏链接(如 obfsParam=undefined / host:null),这类链接任何客户端都无法使用
+				if (isBrokenLink(link)) return;
 				if (proxyPrefix.some((prefix) => link.startsWith(base64Decode(prefix)))) uniqueSet.add(link);
 			});
 			// 转换为数组
 			const uniqueArray = Array.from(uniqueSet);
 			return uniqueArray;
 		} else {
-			try {
-				// 聚合配置常见两种形态:1)用---分隔的多文档;2)直接拼接(顶层key重复,js-yaml会报错)。
-				// 先用loadAll处理多文档,失败再按顶层key重复边界拆分逐个解析,最后合并proxies节点
-				let yamlObjects = [];
-				try {
-					yamlObjects = yaml.loadAll(content);
-				} catch (loadAllError) {
-					for (const chunk of splitClashDuplicated(content)) {
-						try {
-							const obj = yaml.load(chunk);
-							if (obj && typeof obj === 'object') {
-								yamlObjects.push(obj);
-							}
-						} catch (chunkError) {
-							// 单个块解析失败忽略,不影响其它块
-						}
+			// 解析yaml(零第三方依赖的自研解析器):
+			// 兼容 --- 多文档与顶层key重复的聚合配置(拆分后合并proxies节点)
+			const yamlObjects = yamlParseAll(content);
+			let mergedProxies = [];
+			for (const obj of yamlObjects) {
+				if (obj && typeof obj === 'object') {
+					const ps = findFieldValue(obj, 'proxies');
+					if (Array.isArray(ps)) {
+						mergedProxies.push(...ps);
 					}
 				}
-				let mergedProxies = [];
-				for (const obj of yamlObjects) {
-					if (obj && typeof obj === 'object') {
-						const ps = findFieldValue(obj, 'proxies');
-						if (Array.isArray(ps)) {
-							mergedProxies.push(...ps);
-						}
-					}
-				}
-				if (mergedProxies.length > 0) {
-					outbounds = mergedProxies;
-				}
-			} catch (yamlError) {
-				// 解析yaml失败(例如源数据是损坏的json/yaml)，跳过该链接，不影响其它链接
-				console.error(`解析${url} 的yaml内容失败: ${yamlError.message}`);
+			}
+			if (mergedProxies.length > 0) {
+				outbounds = mergedProxies;
 			}
 		}
 	}
@@ -564,9 +1044,30 @@ async function fetchAndProcessUrl(url) {
 		if (server && pwd_auth) {
 			// 判断是hy2
 
-			return `hy2://${pwd_auth}@${server}?insecure=${insecure}&sni=${sni}#[hy2]_${server}`;
+			// 只有当server未携带端口号时才拼接默认端口443
+			if (!hostAlreadyHasPort(server)) {
+				if (server.includes(':') && !server.startsWith('[')) {
+					server = `[${server}]`; // 裸IPv6地址需要加中括号
+				}
+				server = `${server}:443`;
+			}
+			// 用URLSearchParams拼接参数,避免出现 insecure= / sni=null 之类的空参数
+			const hy2Params = new URLSearchParams();
+			if (insecure === 1) hy2Params.set('insecure', '1');
+			if (sni) hy2Params.set('sni', sni);
+			const hy2Query = hy2Params.toString();
+
+			return `hy2://${encodeURIComponent(pwd_auth)}@${server}${hy2Query ? '?' + hy2Query : ''}#[hy2]_${server}`;
 		} else if (server && auth && alpn && upmbps !== null && downmbps !== null) {
 			// 判断是hy1
+
+			// 只有当server未携带端口号时才拼接默认端口443
+			if (!hostAlreadyHasPort(server)) {
+				if (server.includes(':') && !server.startsWith('[')) {
+					server = `[${server}]`; // 裸IPv6地址需要加中括号
+				}
+				server = `${server}:443`;
+			}
 
 			let hysteriaDict = {
 				upmbps: upmbps,
@@ -611,9 +1112,8 @@ async function fetchAndProcessUrl(url) {
 		// 存储多个节点链接
 		const uniqueSet = new Set();
 
-		// let allProxyType = ['hysteria', 'hy2', 'vless', 'vmess', 'trojan', 'ss', 'tuic'];
-		let allProxyType = ['aHlzdGVyaWE', 'aHky', 'dmxlc3M', 'dm1lc3M', 'dHJvamFu', 'c3M', 'dHVpYw'];
-		// 遍历数组中的节点
+			let allProxyType = ['hysteria', 'hy2', 'vless', 'vmess', 'trojan', 'ss', 'tuic'];
+			// 遍历数组中的节点
 		for (var i = 0; i < outbounds.length; i++) {
 			let proxyType = findFieldValue(outbounds[i], 'protocol');
 			if (!allProxyType.includes(proxyType)) {
@@ -622,43 +1122,43 @@ async function fetchAndProcessUrl(url) {
 			// 检查到是hysteria类型的节点
 			if (proxyType === base64Decode('aHlzdGVyaWE')) {
 				let hy1 = parse_hysteria(outbounds[i]);
-				if (hy1) {
+				if (hy1 && !isBrokenLink(hy1)) {
 					uniqueSet.add(hy1);
 				}
 				// 检查到是hy2类型的节点(clash中该类型名为hysteria2,也要兼容)
 			} else if (proxyType === base64Decode('aHky') || proxyType === 'hysteria2') {
 				let hy2 = parse_hy2(outbounds[i]);
-				if (hy2) {
+				if (hy2 && !isBrokenLink(hy2)) {
 					uniqueSet.add(hy2);
 				}
 				// 检查到是shadowsocks类型的节点
 			} else if (proxyType === base64Decode('c3M')) {
 				let ss = parse_shadowsocks(outbounds[i]);
-				if (ss) {
+				if (ss && !isBrokenLink(ss)) {
 					uniqueSet.add(ss);
 				}
 				// 检查到是vless类型的节点
 			} else if (proxyType === base64Decode('dmxlc3M')) {
 				let vle55 = parse_vle55(outbounds[i]);
-				if (vle55) {
+				if (vle55 && !isBrokenLink(vle55)) {
 					uniqueSet.add(vle55);
 				}
 				// 检查到是vmess类型的节点
 			} else if (proxyType === base64Decode('dm1lc3M')) {
 				let vme55 = parse_vme55(outbounds[i]);
-				if (vme55) {
+				if (vme55 && !isBrokenLink(vme55)) {
 					uniqueSet.add(vme55);
 				}
 				// 检查到是trojan类型的节点
 			} else if (proxyType === base64Decode('dHJvamFu')) {
 				let tr0jan = parse_tr0jan(outbounds[i]);
-				if (tr0jan) {
+				if (tr0jan && !isBrokenLink(tr0jan)) {
 					uniqueSet.add(tr0jan);
 				}
 				// 检查到是tuic类型的节点
 			} else if (proxyType === base64Decode('dHVpYw')) {
 				let tuic = parse_tuic(outbounds[i]);
-				if (tuic) {
+				if (tuic && !isBrokenLink(tuic)) {
 					uniqueSet.add(tuic);
 				}
 			}
@@ -696,6 +1196,12 @@ function base64Decode(base64Str) {
 	return decoder.decode(bytes);
 }
 
+// 兼容 base64url(- _)与缺失填充(=)的写法,统一转换为标准base64
+function normalizeBase64(str) {
+	const noPad = str.replace(/=+$/, '').replace(/-/g, '+').replace(/_/g, '/');
+	return noPad + '='.repeat((4 - (noPad.length % 4)) % 4);
+}
+
 // 判断是否是有效的Base64编码字符串
 function isValidBase64(str) {
 	if (typeof str !== 'string') return false;
@@ -706,16 +1212,16 @@ function isValidBase64(str) {
 	// 兼容多行base64订阅:去除所有空白字符后再校验
 	const cleaned = str.replace(/\s+/g, '');
 
+	// 兼容 base64url(- _)与缺失填充(=)的写法
+	const normalized = normalizeBase64(cleaned);
+
 	// Base64正则匹配规则，确保格式正确
 	const base64Regex = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-	if (!base64Regex.test(cleaned)) return false;
-
-	// 长度必须是4的倍数
-	if (cleaned.length % 4 !== 0) return false;
+	if (!base64Regex.test(normalized)) return false;
 
 	try {
 		// 尝试解码，确保不会报错
-		const binaryStr = atob(cleaned);
+		const binaryStr = atob(normalized);
 		new Uint8Array([...binaryStr].map((c) => c.charCodeAt(0)));
 		return true;
 	} catch (e) {
@@ -747,7 +1253,8 @@ function v2rayLinksHandle(str) {
 	}
 
 	try {
-		return base64Decode(str.replace(/\s+/g, ''));
+		// 兼容 base64url 与缺失填充的写法
+		return base64Decode(normalizeBase64(str.replace(/\s+/g, '')));
 	} catch (e) {
 		return ''; // 如果解码失败，也返回空字符串
 	}
@@ -776,7 +1283,7 @@ const targetUrls = [
 	'https://fastly.jsdelivr.net/gh/chengaopan/AutoMergePublicNodes@master/list.meta.yml',
 	'https://fastly.jsdelivr.net/gh/peasoft/NoMoreWalls@master/list.meta.yml',
 	'https://gcore.jsdelivr.net/gh/peasoft/NoMoreWalls@master/list.meta.yml',
-	'https://ghproxy.cn/https://raw.githubusercontent.com/chengaopan/AutoMergePublicNodes/master/list.meta.yml',
+	// ghproxy.cn 已失效(返回HTML拦截页),已移除;ghproxy.net 仍可用
 	'https://ghproxy.net/https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.meta.yml',
 	'https://raw.githubusercontent.com/chengaopan/AutoMergePublicNodes/master/list.meta.yml',
 	'https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.meta.yml',
@@ -800,7 +1307,6 @@ const targetUrls = [
 	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/clash.meta2/5/config.yaml',
 	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/clash.meta2/4/config.yaml',
 	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ipp/clash.meta2/1/config.yaml',
-	// 'https://fastly.jsdelivr.net/gh/jsvpn/jsproxy@dev/yule/20200325/1299699.md',
 	'https://www.gitlabip.xyz/Alvin9999/PAC/master/backup/img/1/2/ip/clash.meta2/1/config.yaml',
 	'https://www.gitlabip.xyz/Alvin9999/pac2/master/quick/config.yaml',
 	'https://www.gitlabip.xyz/Alvin9999/pac2/master/quick/4/config.yaml',
@@ -923,6 +1429,7 @@ function vmessNodeFromJson(j) {
 
 // 解析一条分享链接(vless/vmess/trojan/ss/hysteria/hy2/tuic/naive)为统一结构的节点对象
 function parseShareLink(link) {
+	link = String(link).trim(); // 去掉可能残留的 \r / 首尾空白
 	let type = '';
 	if (link.startsWith('vless://')) type = 'vless';
 	else if (link.startsWith('vmess://')) type = 'vmess';
@@ -1132,9 +1639,24 @@ function dedupeNodeNames(nodes) {
 	});
 }
 
+// mihomo/clash 的 server 字段里 IPv6 地址必须加中括号(Go SplitHostPort 约定)
+function clashServer(host) {
+	return host && host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
+
+// 拆分 SIP002 插件字符串 "名称;参数" 为两部分
+function splitPlugin(plugin) {
+	if (!plugin) return { name: '', opts: '' };
+	const sep = plugin.indexOf(';');
+	if (sep >= 0) return { name: plugin.slice(0, sep), opts: plugin.slice(sep + 1) };
+	return { name: plugin, opts: '' };
+}
+
 // 构建完整的 clash 配置(proxies + 基本的proxy-groups)
 function buildClashConfig(nodes) {
 	const proxies = dedupeNodeNames(nodes).map(toClashProxy).filter(Boolean);
+	// 没有转换出任何节点时返回空配置,避免生成引用空列表的proxy-groups
+	if (proxies.length === 0) return { proxies: [] };
 	const names = proxies.map((p) => p.name);
 	return {
 		proxies: proxies,
@@ -1204,7 +1726,7 @@ function clashTransportOpts(node, network) {
 }
 
 function toClashVless(node) {
-	const proxy = { name: node.name, type: 'vless', server: node.server, port: node.port, uuid: node.uuid, udp: true };
+	const proxy = { name: node.name, type: 'vless', server: clashServer(node.server), port: node.port, uuid: node.uuid, udp: true };
 	const network = node.network || 'tcp';
 	if (network !== 'tcp') proxy.network = network;
 	if (node.flow && network === 'tcp') proxy.flow = node.flow;
@@ -1229,7 +1751,7 @@ function toClashVmess(node) {
 	const proxy = {
 		name: node.name,
 		type: 'vmess',
-		server: node.server,
+		server: clashServer(node.server),
 		port: node.port,
 		uuid: node.uuid,
 		alterId: node.alterId || 0,
@@ -1254,7 +1776,7 @@ function toClashTrojan(node) {
 	const proxy = {
 		name: node.name,
 		type: 'trojan',
-		server: node.server,
+		server: clashServer(node.server),
 		port: node.port,
 		password: node.password,
 		udp: true,
@@ -1276,23 +1798,30 @@ function toClashSs(node) {
 	const proxy = {
 		name: node.name,
 		type: 'ss',
-		server: node.server,
+		server: clashServer(node.server),
 		port: node.port,
 		cipher: node.method,
 		password: node.password,
 		udp: true,
 	};
-	if (node.plugin) proxy.plugin = node.plugin;
+	if (node.plugin) {
+		// mihomo 推荐拆成 plugin + plugin-opts 两个字段
+		const { name: pname, opts: popts } = splitPlugin(node.plugin);
+		proxy.plugin = pname;
+		if (popts) proxy['plugin-opts'] = popts;
+	}
 	return proxy;
 }
 
 function toClashHysteria(node) {
-	const proxy = { name: node.name, type: 'hysteria', server: node.server, port: node.port, udp: true };
+	const proxy = { name: node.name, type: 'hysteria', server: clashServer(node.server), port: node.port, udp: true };
 	proxy.up = node.up ? String(node.up) : '20';
 	proxy.down = node.down ? String(node.down) : '100';
-	if (node.auth) proxy.auth = node.auth;
-	if (node.obfs) proxy.obfs = node.obfs;
-	if (node.obfsParam) proxy['obfs-param'] = node.obfsParam;
+	// mihomo(clash) 的 hysteria 用 auth-str 表示明文密码
+	if (node.auth) proxy['auth-str'] = node.auth;
+	// hysteria v1 的 obfs 字段是混淆密码。优先取 obfsParam(nekoray格式),再回退 obfs
+	if (node.obfsParam) proxy.obfs = node.obfsParam;
+	else if (node.obfs) proxy.obfs = node.obfs;
 	if (node.protocol) proxy.protocol = node.protocol;
 	if (node.peer || node.sni) proxy.sni = node.peer || node.sni;
 	if (node.insecure) proxy['skip-cert-verify'] = true;
@@ -1304,7 +1833,7 @@ function toClashHy2(node) {
 	const proxy = {
 		name: node.name,
 		type: 'hysteria2',
-		server: node.server,
+		server: clashServer(node.server),
 		port: node.port,
 		password: node.password,
 		udp: true,
@@ -1322,7 +1851,7 @@ function toClashTuic(node) {
 	const proxy = {
 		name: node.name,
 		type: 'tuic',
-		server: node.server,
+		server: clashServer(node.server),
 		port: node.port,
 		uuid: node.uuid,
 		password: node.password,
@@ -1340,7 +1869,7 @@ function toClashNaive(node) {
 	return {
 		name: node.name,
 		type: 'naive',
-		server: node.server,
+		server: clashServer(node.server),
 		port: node.port,
 		username: node.username,
 		password: node.password,
@@ -1450,6 +1979,7 @@ function singboxVmess(node) {
 		uuid: node.uuid,
 		security: node.cipher || 'auto',
 	};
+	if (node.alterId) ob.alter_id = node.alterId;
 	const tls = singboxTls(node, false);
 	if (tls) ob.tls = tls;
 	const transport = singboxTransport(node);
@@ -1473,7 +2003,7 @@ function singboxTrojan(node) {
 }
 
 function singboxSs(node) {
-	return {
+	const ob = {
 		type: 'shadowsocks',
 		tag: node.name,
 		server: node.server,
@@ -1481,6 +2011,12 @@ function singboxSs(node) {
 		method: node.method,
 		password: node.password,
 	};
+	if (node.plugin) {
+		const { name, opts } = splitPlugin(node.plugin);
+		ob.plugin = name;
+		if (opts) ob.plugin_opts = opts;
+	}
+	return ob;
 }
 
 function singboxHysteria(node) {
@@ -1489,9 +2025,9 @@ function singboxHysteria(node) {
 	ob.up_mbps = node.up || 20;
 	ob.down_mbps = node.down || 100;
 	if (node.auth) ob.auth_str = node.auth;
-	if (node.obfs) ob.obfs = node.obfs;
-	if (node.obfsParam) ob.obfs_param = node.obfsParam;
-	if (node.protocol) ob.protocol = node.protocol;
+	// sing-box 的 hysteria 用 obfs 字符串直接表示混淆密码。优先取 obfsParam,再回退 obfs
+	if (node.obfsParam) ob.obfs = node.obfsParam;
+	else if (node.obfs) ob.obfs = node.obfs;
 	const tls = { enabled: true };
 	if (node.peer || node.sni) tls.server_name = node.peer || node.sni;
 	if (node.insecure) tls.insecure = true;
@@ -1594,8 +2130,8 @@ export default {
 				// 调用函数并处理结果
 				let resultsArray = await processUrls(targetUrls);
 
-				// 使用Set数据结构的特性去重（再次去重）,并剔除空字符串
-				let uniqueStrings = [...new Set(resultsArray)].filter((item) => item !== '');
+				// 使用Set数据结构的特性去重（再次去重）,并剔除空字符串和带占位符的坏链接
+				let uniqueStrings = [...new Set(resultsArray)].filter((item) => item !== '' && !isBrokenLink(item));
 
 				// 排序
 				let sortedArray = uniqueStrings.sort((a, b) => {
@@ -1661,7 +2197,7 @@ export default {
 				});
 			}
 			if (format === 'clash') {
-				body = yaml.dump(buildClashConfig(nodes));
+				body = yamlDump(buildClashConfig(nodes));
 				contentType = 'text/yaml; charset=UTF-8';
 			} else {
 				body = JSON.stringify(buildSingboxConfig(nodes), null, 2);
